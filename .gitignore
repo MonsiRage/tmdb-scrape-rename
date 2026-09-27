@@ -1,0 +1,14 @@
+# 私密：TMDB API key（绝不要提交）
+tmdb_api_key.txt
+
+# 运行时缓存 / 日志
+*.json
+
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller 构建产物（exe 在 Releases 页面发布）
+build/
+dist/
+*.exe
