@@ -29,7 +29,7 @@ pythonw tmdb_刮削命名.pyw
 
 选择扫描根目录 → 点「仅预览（不改名、不写文件）」或「确认刮削（正式更改）」。结果按「概览 / 电影识别 / 剧集识别 / 未能匹配 / 更改」分标签显示。
 
-不想装 Python 的话，可以去 [Releases](../../releases) 页面下载打包好的 Windows exe（如有）。
+不想装 Python 的话，可以去 [Releases](../../releases) 页面下载打包好的 Windows exe（`TMDB-scrape-rename.exe`）。exe 内置引擎，修改旁边的 .py 不会生效；同样需要在 exe 同目录放 `tmdb_api_key.txt` 或设置环境变量 `TMDB_API_KEY`。
 
 ### 2. bat 一键运行
 
