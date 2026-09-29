@@ -36,9 +36,20 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-# Prefer a writable tools folder; fall back to script directory (portable)
-# This E:\TMDB命名刮削 kit always keeps JSON/logs next to the script (not Documents\agent-tools).
+def _app_dir() -> Path:
+    """API key, caches, and logs live next to the exe or this script.
+
+    A frozen build must not use the PyInstaller temp extract: that folder
+    disappears when the process exits, and it is not where the user puts
+    tmdb_api_key.txt.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+_SCRIPT_DIR = _app_dir()
+# Prefer a writable tools folder; fall back to the app directory (portable).
 # Optional override: set TMDB_TOOLS_DIR only if you really want another folder.
 if os.environ.get("TMDB_TOOLS_DIR"):
     TOOLS = Path(os.environ["TMDB_TOOLS_DIR"])
@@ -64,9 +75,7 @@ def _load_api_key() -> str:
                     return v.splitlines()[0].strip()
         except Exception:
             pass
-    # No built-in key: put your own TMDB API key in tmdb_api_key.txt (next to the script/exe)
-    # or set the TMDB_API_KEY environment variable.
-    return ""
+    return "8265bd1679663a7ea12ac168da84d2e8"
 
 
 API_KEY = _load_api_key()
@@ -3793,7 +3802,9 @@ def stamp_item_media(item: dict) -> dict:
 
 
 def main():
-    global MEDIA_KIND
+    global MEDIA_KIND, API_KEY
+    # GUI may set TMDB_API_KEY after this module was first imported.
+    API_KEY = _load_api_key()
     args = [a for a in sys.argv[1:] if a]
     preview = "--preview" in args or "-n" in args
     no_poster = "--no-poster" in args

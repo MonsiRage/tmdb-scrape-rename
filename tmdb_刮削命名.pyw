@@ -58,6 +58,28 @@ def engine_importable() -> bool:
         return False
 
 
+def engine_ready(script: Path) -> bool:
+    """Frozen exe uses the bundled module. A loose .py is only for the .pyw."""
+    if getattr(sys, "frozen", False):
+        return engine_importable()
+    return script.is_file() or engine_importable()
+
+
+def read_saved_api_key() -> str:
+    """Key already stored next to the program, else the environment."""
+    path = app_dir() / "tmdb_api_key.txt"
+    try:
+        if path.is_file():
+            v = path.read_text(encoding="utf-8", errors="ignore").strip()
+            if v and not v.startswith("#"):
+                line = v.splitlines()[0].strip()
+                if line:
+                    return line
+    except Exception:
+        pass
+    return (os.environ.get("TMDB_API_KEY") or "").strip()
+
+
 class _LineWriter:
     """Capture engine prints into GUI log line-by-line."""
 
@@ -146,8 +168,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("TMDB 刮削命名")
-        self.geometry("760x280")
-        self.minsize(620, 260)
+        self.geometry("760x360")
+        self.minsize(620, 330)
         self.tools = find_tools_dir()
         os.environ["TMDB_TOOLS_DIR"] = str(app_dir())
         self.script = self.tools / "tmdb_format_rename.py"
@@ -157,10 +179,11 @@ class App(tk.Tk):
         self._media = "auto"
         self._build_chooser()
         self._stop_flag = False
-        if not self.script.is_file() and not engine_importable():
+        if not engine_ready(self.script):
             messagebox.showerror(
                 "缺少引擎",
-                "找不到 tmdb_format_rename（同目录 .py 或已打包进 exe）。\n"
+                "找不到 tmdb_format_rename。\n"
+                "请使用 TMDB刮削命名.exe，或把 tmdb_format_rename.py 放在程序同目录。\n"
                 f"目录: {self.tools}",
             )
 
@@ -182,6 +205,22 @@ class App(tk.Tk):
         self.root_var = tk.StringVar(value=str(default_root(self.tools)))
         ttk.Entry(row, textvariable=self.root_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         ttk.Button(row, text="浏览…", command=self._browse).pack(side=tk.LEFT)
+
+        key_row = ttk.Frame(top)
+        key_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(key_row, text="TMDB API Key").pack(side=tk.LEFT)
+        self.api_key_var = tk.StringVar(value=read_saved_api_key())
+        self._api_key_entry = tk.Entry(key_row, textvariable=self.api_key_var, show="*")
+        self._api_key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        self._show_key = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            key_row, text="显示", variable=self._show_key, command=self._toggle_api_key
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            top,
+            text="保存在程序同目录的 tmdb_api_key.txt，不会写进日志。已有文件会自动填入。",
+            foreground="#666",
+        ).pack(anchor="w", pady=(0, 8))
 
         ttk.Label(
             top,
@@ -207,13 +246,45 @@ class App(tk.Tk):
         if path:
             self.root_var.set(path)
 
+    def _toggle_api_key(self) -> None:
+        self._api_key_entry.configure(show="" if self._show_key.get() else "*")
+
+    def _persist_api_key(self) -> str:
+        """Save the key beside the program and expose it to the engine."""
+        var = getattr(self, "api_key_var", None)
+        if var is not None:
+            key = (var.get() or "").strip()
+        else:
+            key = read_saved_api_key()
+        if not key:
+            return ""
+        path = app_dir() / "tmdb_api_key.txt"
+        try:
+            path.write_text(key + "\n", encoding="utf-8")
+        except Exception as e:
+            messagebox.showerror("无法保存 API Key", f"{path}\n{e}")
+            return ""
+        os.environ["TMDB_API_KEY"] = key
+        return key
+
     def _choose(self, preview: bool) -> None:
         root = normalize_root(self.root_var.get())
         if not root.exists() or not root.is_dir():
             messagebox.showerror("目录无效", f"扫描根目录不存在:\n{root}")
             return
-        if not self.script.is_file():
-            messagebox.showerror("缺少脚本", f"找不到:\n{self.script}")
+        if not engine_ready(self.script):
+            messagebox.showerror(
+                "缺少引擎",
+                "找不到 tmdb_format_rename。\n"
+                "请使用 TMDB刮削命名.exe，或把 tmdb_format_rename.py 放在程序同目录。\n"
+                f"目录: {self.tools}",
+            )
+            return
+        if not self._persist_api_key():
+            messagebox.showerror(
+                "缺少 API Key",
+                "请填写 TMDB API Key。\n它会保存在程序同目录的 tmdb_api_key.txt。",
+            )
             return
         media = "auto"
         # 仅预览：直接开跑，不弹确认框；正式刮削才确认
@@ -743,7 +814,7 @@ class App(tk.Tk):
             return
         for w in self.winfo_children():
             w.destroy()
-        self.geometry("760x280")
+        self.geometry("760x360")
         self.title("TMDB 刮削命名")
         self._scan_root = None
         self._last_was_preview = False
@@ -754,6 +825,12 @@ class App(tk.Tk):
         self.log.see(tk.END)
 
     def _run(self, root: Path, preview: bool, media: str) -> None:
+        if not self._persist_api_key():
+            messagebox.showerror(
+                "缺少 API Key",
+                "请回到首页填写 TMDB API Key。\n它会保存在程序同目录的 tmdb_api_key.txt。",
+            )
+            return
         os.environ["TMDB_TOOLS_DIR"] = str(app_dir())
         os.environ["PYTHONIOENCODING"] = "utf-8"
         frozen = bool(getattr(sys, "frozen", False))
@@ -788,8 +865,10 @@ class App(tk.Tk):
                     sys.stdout = _LineWriter(emit)  # type: ignore[assignment]
                     sys.stderr = sys.stdout  # type: ignore[assignment]
                     sys.argv = ["tmdb_format_rename.py", *cli]
-                    # Ensure caches/json land next to exe on portable drive
+                    # Caches land next to the exe. Re-read the key in case this
+                    # module was imported before the user typed one.
                     eng.TOOLS = Path(os.environ["TMDB_TOOLS_DIR"])
+                    eng.API_KEY = eng._load_api_key()
                     try:
                         code = int(eng.main() or 0)
                     finally:

@@ -1,11 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Portable one-file: bundles tmdb_format_rename so other PCs need no system Python.
+# One-file windowed exe. The engine is compiled in via hiddenimports.
+# Do not ship tmdb_format_rename.py as data: that extracts a .py the exe
+# would still look like it depends on. No system Python and no sibling .py.
 
 a = Analysis(
     ['tmdb_刮削命名.pyw'],
     pathex=[],
     binaries=[],
-    datas=[('tmdb_format_rename.py', '.')],
+    datas=[],
     hiddenimports=['tmdb_format_rename'],
     hookspath=[],
     hooksconfig={},
