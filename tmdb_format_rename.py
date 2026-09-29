@@ -38,28 +38,84 @@ from datetime import datetime
 from pathlib import Path
 
 def _app_dir() -> Path:
-    """API key, caches, and logs live next to the exe or this script.
-
-    A frozen build must not use the PyInstaller temp extract: that folder
-    disappears when the process exits, and it is not where the user puts
-    tmdb_api_key.txt.
-    """
+    """Folder of the exe or this script. Not the PyInstaller temp extract."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
 
+def _roaming_dir() -> Path:
+    """Key, JSON caches, and run logs. Not beside the exe (OneDrive would sync them)."""
+    base = (os.environ.get("APPDATA") or "").strip()
+    if not base:
+        base = str(Path.home() / "AppData" / "Roaming")
+    return Path(base) / "TMDB刮削命名"
+
+
+# Files that used to be written next to the exe / script.
+_SIDECAR_NAMES = (
+    "tmdb_api_key.txt",
+    "tmdb_movie_title_cache.json",
+    "tmdb_search_cache.json",
+    "tmdb_format_rename_last.json",
+    "tmdb_format_rename_apply.json",
+    "tmdb_format_rename_posters.json",
+)
+
+
+def _adopt_sidecar(dest: Path, src: Path) -> None:
+    """Move a key/json left beside the exe into Roaming. Roaming wins if both exist."""
+    try:
+        if dest.resolve() == src.resolve():
+            return
+    except Exception:
+        return
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    for name in _SIDECAR_NAMES:
+        old = src / name
+        new = dest / name
+        try:
+            if not old.is_file():
+                continue
+            if (not new.exists()) or new.stat().st_size == 0:
+                if new.exists():
+                    new.unlink()
+                shutil.move(str(old), str(new))
+            else:
+                old.unlink()
+        except Exception:
+            try:
+                if old.is_file() and not new.exists():
+                    shutil.copy2(str(old), str(new))
+                    old.unlink()
+            except Exception:
+                pass
+
+
+def _data_dir() -> Path:
+    """Roaming by default. TMDB_TOOLS_DIR still overrides (tests / explicit path)."""
+    override = (os.environ.get("TMDB_TOOLS_DIR") or "").strip()
+    if override:
+        d = Path(override)
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        except Exception:
+            return _app_dir()
+    d = _roaming_dir()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return _app_dir()
+    _adopt_sidecar(d, _app_dir())
+    return d
+
+
 _SCRIPT_DIR = _app_dir()
-# Prefer a writable tools folder; fall back to the app directory (portable).
-# Optional override: set TMDB_TOOLS_DIR only if you really want another folder.
-if os.environ.get("TMDB_TOOLS_DIR"):
-    TOOLS = Path(os.environ["TMDB_TOOLS_DIR"])
-else:
-    TOOLS = _SCRIPT_DIR
-try:
-    TOOLS.mkdir(parents=True, exist_ok=True)
-except Exception:
-    TOOLS = _SCRIPT_DIR
+TOOLS = _data_dir()
 
 UA = "tmdb-format-rename/1.5"
 
@@ -3961,8 +4017,11 @@ def stamp_item_media(item: dict) -> dict:
 
 
 def main():
-    global MEDIA_KIND, API_KEY
-    # GUI may set TMDB_API_KEY after this module was first imported.
+    global MEDIA_KIND, API_KEY, TOOLS, CACHE_PATH, SEARCH_CACHE_PATH
+    # GUI may set TMDB_API_KEY / TMDB_TOOLS_DIR after this module was first imported.
+    TOOLS = _data_dir()
+    CACHE_PATH = TOOLS / "tmdb_movie_title_cache.json"
+    SEARCH_CACHE_PATH = TOOLS / "tmdb_search_cache.json"
     API_KEY = _load_api_key()
     args = [a for a in sys.argv[1:] if a]
     preview = "--preview" in args or "-n" in args

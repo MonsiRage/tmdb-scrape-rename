@@ -65,9 +65,19 @@ def engine_ready(script: Path) -> bool:
     return script.is_file() or engine_importable()
 
 
+def data_dir() -> Path:
+    """Same folder the engine uses: %AppData%\\Roaming\\TMDB刮削命名."""
+    try:
+        import tmdb_format_rename as eng
+        return Path(eng.TOOLS)
+    except Exception:
+        base = (os.environ.get("APPDATA") or "").strip() or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "TMDB刮削命名"
+
+
 def read_saved_api_key() -> str:
-    """Key already stored next to the program, else the environment."""
-    path = app_dir() / "tmdb_api_key.txt"
+    """Key already stored in Roaming, else the environment."""
+    path = data_dir() / "tmdb_api_key.txt"
     try:
         if path.is_file():
             v = path.read_text(encoding="utf-8", errors="ignore").strip()
@@ -171,7 +181,6 @@ class App(tk.Tk):
         self.geometry("760x360")
         self.minsize(620, 330)
         self.tools = find_tools_dir()
-        os.environ["TMDB_TOOLS_DIR"] = str(app_dir())
         self.script = self.tools / "tmdb_format_rename.py"
         self.proc = None
         self._scan_root: Path | None = None
@@ -218,7 +227,7 @@ class App(tk.Tk):
         ).pack(side=tk.LEFT)
         ttk.Label(
             top,
-            text="保存在程序同目录的 tmdb_api_key.txt，不会写进日志。已有文件会自动填入。",
+            text="API Key 和 JSON 缓存在 %AppData%\\Roaming\\TMDB刮削命名，不会写进日志，也不会放在 exe 旁边。",
             foreground="#666",
         ).pack(anchor="w", pady=(0, 8))
 
@@ -237,7 +246,7 @@ class App(tk.Tk):
             btns, text="确认刮削（正式更改）", command=lambda: self._choose(False)
         ).pack(side=tk.LEFT, padx=(0, 12), ipadx=10, ipady=8)
         ttk.Button(btns, text="退出", command=self.destroy).pack(side=tk.RIGHT, ipadx=10, ipady=8)
-        ttk.Label(top, text=f"JSON/日志目录: {app_dir()}", foreground="#666").pack(
+        ttk.Label(top, text=f"数据目录: {data_dir()}", foreground="#666").pack(
             anchor="w", pady=(10, 0)
         )
 
@@ -258,7 +267,7 @@ class App(tk.Tk):
             key = read_saved_api_key()
         if not key:
             return ""
-        path = app_dir() / "tmdb_api_key.txt"
+        path = data_dir() / "tmdb_api_key.txt"
         try:
             path.write_text(key + "\n", encoding="utf-8")
         except Exception as e:
@@ -283,7 +292,7 @@ class App(tk.Tk):
         if not self._persist_api_key():
             messagebox.showerror(
                 "缺少 API Key",
-                "请填写 TMDB API Key。\n它会保存在程序同目录的 tmdb_api_key.txt。",
+                "请填写 TMDB API Key。\n它会保存在 %AppData%\\Roaming\\TMDB刮削命名\\tmdb_api_key.txt。",
             )
             return
         media = "auto"
@@ -500,8 +509,8 @@ class App(tk.Tk):
         self._run(root, False, self._media)
 
     def _load_results(self) -> None:
-        last_path = app_dir() / "tmdb_format_rename_last.json"
-        apply_path = app_dir() / "tmdb_format_rename_apply.json"
+        last_path = data_dir() / "tmdb_format_rename_last.json"
+        apply_path = data_dir() / "tmdb_format_rename_apply.json"
         data: dict = {}
         apply: dict = {}
         if last_path.is_file():
@@ -828,10 +837,10 @@ class App(tk.Tk):
         if not self._persist_api_key():
             messagebox.showerror(
                 "缺少 API Key",
-                "请回到首页填写 TMDB API Key。\n它会保存在程序同目录的 tmdb_api_key.txt。",
+                "请回到首页填写 TMDB API Key。\n它会保存在 %AppData%\\Roaming\\TMDB刮削命名\\tmdb_api_key.txt。",
             )
             return
-        os.environ["TMDB_TOOLS_DIR"] = str(app_dir())
+        os.environ["TMDB_TOOLS_DIR"] = str(data_dir())
         os.environ["PYTHONIOENCODING"] = "utf-8"
         frozen = bool(getattr(sys, "frozen", False))
         cli = [str(root), f"--media={media}"]
@@ -844,7 +853,7 @@ class App(tk.Tk):
             py = find_python_for_script()
             args = [py, "-u", str(self.script), *cli]
             self._log(("PREVIEW " if preview else "APPLY ") + " ".join(args[2:]))
-        self._log(f"JSON dir: {app_dir()}")
+        self._log(f"数据目录: {data_dir()}")
         self.btn_again.configure(state=tk.DISABLED)
         self.btn_reload.configure(state=tk.DISABLED)
         self.btn_apply.configure(state=tk.DISABLED)
@@ -865,9 +874,10 @@ class App(tk.Tk):
                     sys.stdout = _LineWriter(emit)  # type: ignore[assignment]
                     sys.stderr = sys.stdout  # type: ignore[assignment]
                     sys.argv = ["tmdb_format_rename.py", *cli]
-                    # Caches land next to the exe. Re-read the key in case this
-                    # module was imported before the user typed one.
+                    # Re-read the key in case this module was imported before the user typed one.
                     eng.TOOLS = Path(os.environ["TMDB_TOOLS_DIR"])
+                    eng.CACHE_PATH = eng.TOOLS / "tmdb_movie_title_cache.json"
+                    eng.SEARCH_CACHE_PATH = eng.TOOLS / "tmdb_search_cache.json"
                     eng.API_KEY = eng._load_api_key()
                     try:
                         code = int(eng.main() or 0)
@@ -891,7 +901,7 @@ class App(tk.Tk):
                         text=True,
                         encoding="utf-8",
                         errors="replace",
-                        env={**os.environ, "PYTHONIOENCODING": "utf-8", "TMDB_TOOLS_DIR": str(app_dir())},
+                        env={**os.environ, "PYTHONIOENCODING": "utf-8", "TMDB_TOOLS_DIR": str(data_dir())},
                         creationflags=creation,
                     )
                     assert self.proc.stdout is not None

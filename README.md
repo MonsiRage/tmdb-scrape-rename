@@ -29,7 +29,7 @@ pythonw tmdb_刮削命名.pyw
 
 选择扫描根目录 → 点「仅预览（不改名、不写文件）」或「确认刮削（正式更改）」。结果按「概览 / 电影识别 / 剧集识别 / 未能匹配 / 更改」分标签显示。
 
-不想装 Python 的话，可以去 [Releases](../../releases) 页面下载打包好的 Windows exe（`TMDB-scrape-rename.exe`）。exe 内置引擎，修改旁边的 .py 不会生效；同样需要在 exe 同目录放 `tmdb_api_key.txt` 或设置环境变量 `TMDB_API_KEY`。
+不想装 Python 的话，可以去 [Releases](../../releases) 页面下载打包好的 Windows exe（`TMDB-scrape-rename.exe`）。exe 内置引擎，修改旁边的 .py 不会生效。API Key 和 JSON 缓存在 `%AppData%\Roaming\TMDB刮削命名`，也可以用环境变量 `TMDB_API_KEY`。
 
 ### 2. bat 一键运行
 
@@ -57,12 +57,14 @@ python tmdb_format_rename.py "D:\影片" --media=tv   # 按剧集处理（也可
 
 程序**不内置 key**，请使用你自己的 TMDB API key（在 TMDB 账号设置 → API 里免费申请，使用 v3 的 API Key）：
 
-1. 在程序首页的 **TMDB API Key** 输入框里粘贴。点「仅预览」或「确认刮削」时写入同目录的 `tmdb_api_key.txt`，不会写进日志；已有该文件会自动填入。或者
-2. 直接在脚本（或 exe）**同一目录**新建 `tmdb_api_key.txt`，第一行写入你的 key；或者
+1. 在程序首页的 **TMDB API Key** 输入框里粘贴。点「仅预览」或「确认刮削」时写入 `%AppData%\Roaming\TMDB刮削命名\tmdb_api_key.txt`，不会写进日志；已有该文件会自动填入。或者
+2. 直接在那个目录新建 `tmdb_api_key.txt`，第一行写入你的 key；或者
 3. 设置环境变量 `TMDB_API_KEY`。
+
+以前放在 exe 旁边的 `tmdb_api_key.txt` 和 JSON 会在下次启动时挪进上述目录。
 
 ⚠️ `tmdb_api_key.txt` 已写入 `.gitignore`，**千万不要提交到仓库或分享出去**。
 
 ## 生成的文件
 
-运行时会在脚本目录生成若干 `*.json` 缓存 / 日志（搜索缓存、上次结果等），均已被 `.gitignore` 忽略。
+运行时在 `%AppData%\Roaming\TMDB刮削命名` 生成 JSON 缓存 / 日志（搜索缓存、上次结果等），不放在 exe 旁边。海报、nfo、`tmdb.html` 仍写在各影片文件夹里。
