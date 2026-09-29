@@ -29,6 +29,7 @@ import unicodedata
 import shutil
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.sax.saxutils
@@ -467,17 +468,74 @@ def xml_escape(s: str) -> str:
     return xml.sax.saxutils.escape(s or "", {"'": "&apos;", '"': "&quot;"})
 
 
-def api_get(url: str, retries: int = 3):
-    for i in range(retries):
+# One run asks for the same search/detail URL many times (classify, then
+# score, then the next folder with the same title). Cache the body.
+# TMDB's published ceiling is about 40 requests / 10s; stay under it and
+# wait out HTTP 429 instead of recording the movie as a failure.
+_URL_CACHE: dict[str, dict] = {}
+_REQ_TIMES: list[float] = []
+
+
+def _pace_requests() -> None:
+    window = 10.0
+    limit = 35
+    now = time.monotonic()
+    while _REQ_TIMES and now - _REQ_TIMES[0] >= window:
+        _REQ_TIMES.pop(0)
+    if len(_REQ_TIMES) >= limit:
+        wait = window - (now - _REQ_TIMES[0]) + 0.05
+        if wait > 0:
+            time.sleep(wait)
+        now = time.monotonic()
+        while _REQ_TIMES and now - _REQ_TIMES[0] >= window:
+            _REQ_TIMES.pop(0)
+    _REQ_TIMES.append(time.monotonic())
+
+
+def api_get(url: str, retries: int = 4):
+    cached = _URL_CACHE.get(url)
+    if isinstance(cached, dict):
+        return cached
+    attempt = 0
+    rate_tries = 0
+    while attempt < retries:
+        _pace_requests()
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Connection": "keep-alive"})
+            req = urllib.request.Request(
+                url, headers={"User-Agent": UA, "Connection": "keep-alive"}
+            )
             with urllib.request.urlopen(req, timeout=30) as r:
-                return json.loads(r.read().decode("utf-8", "ignore"))
+                data = json.loads(r.read().decode("utf-8", "ignore"))
+            if not isinstance(data, dict):
+                data = {"_error": "bad_response", "raw": data}
+            _URL_CACHE[url] = data
+            return data
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and rate_tries < 6:
+                rate_tries += 1
+                ra = 0.0
+                try:
+                    ra = float(e.headers.get("Retry-After") or 0)
+                except Exception:
+                    ra = 0.0
+                time.sleep(ra if ra > 0 else min(8.0, 1.5 * rate_tries))
+                continue
+            attempt += 1
+            if attempt >= retries:
+                err = {"_error": f"HTTP {e.code}"}
+                _URL_CACHE[url] = err
+                return err
+            time.sleep(0.6 * attempt)
         except Exception as e:
-            if i == retries - 1:
-                return {"_error": str(e)}
-            time.sleep(0.6 * (i + 1))
-    return {"_error": "unknown"}
+            attempt += 1
+            if attempt >= retries:
+                err = {"_error": str(e)}
+                _URL_CACHE[url] = err
+                return err
+            time.sleep(0.6 * attempt)
+    err = {"_error": "unknown"}
+    _URL_CACHE[url] = err
+    return err
 
 
 def load_json(path: Path) -> dict:
@@ -616,7 +674,6 @@ def fetch_movie_images(tid: str, kind: str | None = None) -> dict:
         f"https://api.themoviedb.org/3/{('tv' if (str(kind or '').lower()=='tv' or (str(kind or '').lower() not in ('movie','tv') and media_is_tv())) else 'movie')}/{tid}/images?api_key={API_KEY}"
         f"&include_image_language=zh,zh-CN,zh-TW,zh-HK,en,null"
     )
-    time.sleep(0.02)
     if not isinstance(data, dict) or data.get("_error"):
         return {"poster_path": "", "backdrop_path": "", "logo_path": ""}
     poster = _pick_best_image(data.get("posters") or [])
@@ -676,16 +733,39 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
         f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}"
         f"&language=zh-CN{append}"
     )
-    time.sleep(0.02)
-    tw = api_get(f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}&language=zh-TW")
-    time.sleep(0.02)
-    hk = api_get(f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}&language=zh-HK")
-    time.sleep(0.02)
-    en = api_get(
-        f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}"
-        f"&language=en-US{append}"
-    )
-    time.sleep(0.02)
+    # zh-CN already carries original_title, credits, and release dates.
+    # zh-TW / zh-HK are only for the case where zh-CN is Japanese or empty.
+    zh_title = ""
+    zh_ok = isinstance(zh, dict) and not zh.get("_error")
+    if zh_ok:
+        zh_title = (zh.get("title") or zh.get("name") or "").strip()
+    tw = None
+    hk = None
+    if zh_ok and (readable_han_title(zh_title) or is_english_title(zh_title)):
+        en = zh
+    elif zh_ok:
+        tw = api_get(f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}&language=zh-TW")
+        tw_title = ""
+        if isinstance(tw, dict) and not tw.get("_error"):
+            tw_title = (tw.get("title") or tw.get("name") or "").strip()
+        if not readable_han_title(tw_title):
+            hk = api_get(f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}&language=zh-HK")
+        en = zh
+    else:
+        en = api_get(
+            f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}"
+            f"&language=en-US{append}"
+        )
+        en_title = ""
+        if isinstance(en, dict) and not en.get("_error"):
+            en_title = (en.get("title") or en.get("name") or "").strip()
+        if not (readable_han_title(en_title) or is_english_title(en_title)):
+            tw = api_get(f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}&language=zh-TW")
+            tw_title = ""
+            if isinstance(tw, dict) and not tw.get("_error"):
+                tw_title = (tw.get("title") or tw.get("name") or "").strip()
+            if not readable_han_title(tw_title):
+                hk = api_get(f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}&language=zh-HK")
     if kind == "tv":
         zh = _normalize_tv_payload(zh)
         tw = _normalize_tv_payload(tw)
@@ -697,8 +777,6 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
     if not isinstance(base, dict) or base.get("_error"):
         cache[tid] = {"ok": False, "error": (base or {}).get("_error")}
         if isinstance(cache.get(tid), dict) and kind in ("movie", "tv"):
-            cache[tid]["kind"] = kind
-        if isinstance(cache.get(tid), dict) and kind in ("movie", "tv"):  # stamp_kind
             cache[tid]["kind"] = kind
         return cache[tid]
 
@@ -856,7 +934,6 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
                     f"https://api.themoviedb.org/3/collection/{col_id}"
                     f"?api_key={API_KEY}&language=zh-CN"
                 )
-                time.sleep(0.02)
                 if isinstance(col_data, dict) and not col_data.get("_error"):
                     col_name = (col_data.get("name") or "").strip()
             collection = {"id": col_id, "name": col_name}
@@ -969,7 +1046,6 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
         "cast": cast,
         "directors": directors,
         "writers": writers,
-        "credits": writers,
         "rating": rating,
         "countries": countries,
         "studios": studios,
@@ -985,8 +1061,6 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
         cache[tid]["ok"] = False
         cache[tid]["error"] = "empty_title"
     if isinstance(cache.get(tid), dict) and kind in ("movie", "tv"):
-        cache[tid]["kind"] = kind
-    if isinstance(cache.get(tid), dict) and kind in ("movie", "tv"):  # stamp_kind
         cache[tid]["kind"] = kind
     return cache[tid]
 
@@ -1519,13 +1593,11 @@ def _search_tmdb_one_kind(kind: str, q: str, year: str | None):
             params["year"] = str(year)
     url = f"https://api.themoviedb.org/3/search/{kind}?" + urllib.parse.urlencode(params)
     data = api_get(url)
-    time.sleep(0.03)
     if not isinstance(data, dict) or data.get("_error"):
         if year:
             params.pop("year", None)
             params.pop("first_air_date_year", None)
             data = api_get(f"https://api.themoviedb.org/3/search/{kind}?" + urllib.parse.urlencode(params))
-            time.sleep(0.03)
     if not isinstance(data, dict) or data.get("_error"):
         return []
     results = data.get("results") or []
@@ -1572,6 +1644,42 @@ def _norm_match_title(s: str) -> str:
 
 
 
+def _search_cache_key(q: str, year, prefer_tid: str = "", prefer_kind: str = "") -> str:
+    """Same key search_tmdb stores. Callers must use this to read the entry back."""
+    mode = "auto" if media_is_auto() else ("tv" if media_is_tv() else "movie")
+    prefer_tid = str(prefer_tid or "").strip()
+    if not prefer_tid.isdigit():
+        prefer_tid = ""
+    prefer_kind = str(prefer_kind or "").strip().lower()
+    if prefer_kind not in ("movie", "tv"):
+        prefer_kind = ""
+    return f"{q}|{year or ''}|{mode}|{prefer_tid}|{prefer_kind}"
+
+
+def _scored_has_exact(scored: list, q: str) -> bool:
+    qn = _norm_match_title(q or "")
+    if not qn:
+        return False
+    for s in scored or []:
+        r0 = s[2] if len(s) > 2 and isinstance(s[2], dict) else {}
+        for k in ("title", "name", "original_title", "original_name"):
+            if _norm_match_title(r0.get(k) or "") == qn:
+                return True
+    return False
+
+
+def _merge_scored(dest: list, extra: list, penalty: int = 0) -> None:
+    have = {x[1] for x in dest}
+    for s in extra:
+        if s[1] in have:
+            continue
+        if penalty:
+            dest.append((s[0] - penalty, s[1], s[2]))
+        else:
+            dest.append(s)
+        have.add(s[1])
+
+
 def search_tmdb(query: str, year: str | None, search_cache: dict, prefer_tid: str | None = None, prefer_kind: str | None = None):
     """Return (tmdb_id, how).
 
@@ -1592,7 +1700,7 @@ def search_tmdb(query: str, year: str | None, search_cache: dict, prefer_tid: st
     if prefer_kind not in ("movie", "tv"):
         prefer_kind = ""
     mode = "auto" if media_is_auto() else ("tv" if media_is_tv() else "movie")
-    key = f"{q}|{year or ''}|{mode}|{prefer_tid or ''}|{prefer_kind or ''}"
+    key = _search_cache_key(q, year, prefer_tid, prefer_kind)
     has_year = bool(year and re.fullmatch(r"\d{4}", str(year)))
     cached = search_cache.get(key) if isinstance(search_cache.get(key), dict) else None
     if cached:
@@ -1609,6 +1717,31 @@ def search_tmdb(query: str, year: str | None, search_cache: dict, prefer_tid: st
             return scored
         yh = [s for s in scored if _year_of(s[2]) == str(year)]
         return yh if yh else []
+
+    def _off_by_one_exact(scored: list):
+        """Unique exact-title hit one year off (filename year vs TMDB)."""
+        if not has_year:
+            return None
+        try:
+            y0 = int(year)
+        except Exception:
+            return None
+        qn = _norm_match_title(q or "")
+        if not qn:
+            return None
+        near = []
+        for s in scored:
+            r0 = s[2] if isinstance(s[2], dict) else {}
+            rd = _year_of(r0)
+            if not rd.isdigit() or abs(int(rd) - y0) != 1:
+                continue
+            for k in ("title", "name", "original_title", "original_name"):
+                if _norm_match_title(r0.get(k) or "") == qn:
+                    near.append(s)
+                    break
+        if len({str(s[1]) for s in near}) == 1:
+            return near[0]
+        return None
 
     def _pick_unique(scored: list):
         """Return (tid, how, scored) after title→year→tmdbid cascade within one side."""
@@ -1647,7 +1780,9 @@ def search_tmdb(query: str, year: str | None, search_cache: dict, prefer_tid: st
                     return None, "ambiguous_no_year", yh
                 # top title unique but wrong year → try year filter empty → no year match
                 if yh == [] and _year_of(scored[0][2]) and _year_of(scored[0][2]) != str(year):
-                    # don't accept wrong-year unique title when year known
+                    hit = _off_by_one_exact(scored)
+                    if hit:
+                        return hit[1], "search_year", [hit]
                     return None, "no_results", scored
             return scored[0][1], "search", scored
         # title collision within side → escalate year
@@ -1677,6 +1812,9 @@ def search_tmdb(query: str, year: str | None, search_cache: dict, prefer_tid: st
                 if len(exact) > 1:
                     return None, "ambiguous_no_year", exact
                 return None, "ambiguous_no_year", yh
+            hit = _off_by_one_exact(scored)
+            if hit:
+                return hit[1], "search_year", [hit]
             return None, "no_results", scored
         # no year: try prefer_tid among title candidates
         if prefer_tid:
@@ -1689,37 +1827,41 @@ def search_tmdb(query: str, year: str | None, search_cache: dict, prefer_tid: st
         # Title search both sides. If BOTH return any candidates, that is a
         # collision — year / folder tmdbid must resolve; otherwise unmatched.
         # Do NOT accept "unique on one side" while the other side also hit.
-        movie_scored = _search_tmdb_one_kind("movie", q, None)
-        tv_scored = _search_tmdb_one_kind("tv", q, None)
+        #
+        # With a year, search that year first (2 calls). The old ±5 sweep
+        # fired 20 more searches for every folder even after an exact hit,
+        # and a big library then tripped TMDB's rate limit.
+        movie_scored: list = []
+        tv_scored: list = []
         if has_year:
-            for s in _search_tmdb_one_kind("movie", q, year):
-                if all(s[1] != x[1] for x in movie_scored):
-                    movie_scored.append(s)
-            for s in _search_tmdb_one_kind("tv", q, year):
-                if all(s[1] != x[1] for x in tv_scored):
-                    tv_scored.append(s)
-            # year±1 exact-title rescue (filename year off-by-one, e.g. The Captain 2017 vs 2018)
+            movie_scored = _search_tmdb_one_kind("movie", q, year)
+            tv_scored = _search_tmdb_one_kind("tv", q, year)
+        if not _scored_has_exact(movie_scored, q) and not _scored_has_exact(tv_scored, q):
+            _merge_scored(movie_scored, _search_tmdb_one_kind("movie", q, None))
+            _merge_scored(tv_scored, _search_tmdb_one_kind("tv", q, None))
+        if has_year and not _scored_has_exact(movie_scored, q) and not _scored_has_exact(tv_scored, q):
+            # Filename year off by one (The Captain 2017 vs 2018).
             try:
                 y0 = int(year)
                 qn = _norm_match_title(q or "")
-                for y2 in [y0 + d for d in (-5, -4, -3, -2, -1, 1, 2, 3, 4, 5)]:
+                for y2 in (y0 - 1, y0 + 1):
                     if y2 < 1900 or y2 > 2099:
                         continue
-                    for s in _search_tmdb_one_kind("movie", q, str(y2)):
-                        r0 = s[2] if isinstance(s[2], dict) else {}
-                        titles = [_norm_match_title(r0.get(k) or "") for k in ("title", "name", "original_title", "original_name")]
-                        if qn and qn in titles and all(s[1] != x[1] for x in movie_scored):
-                            # slight penalty vs exact year
-                            movie_scored.append((s[0] - 30, s[1], s[2]))
-                    for s in _search_tmdb_one_kind("tv", q, str(y2)):
-                        r0 = s[2] if isinstance(s[2], dict) else {}
-                        titles = [_norm_match_title(r0.get(k) or "") for k in ("title", "name", "original_title", "original_name")]
-                        if qn and qn in titles and all(s[1] != x[1] for x in tv_scored):
-                            tv_scored.append((s[0] - 30, s[1], s[2]))
+                    for kind, dest in (("movie", movie_scored), ("tv", tv_scored)):
+                        extra = []
+                        for s in _search_tmdb_one_kind(kind, q, str(y2)):
+                            r0 = s[2] if isinstance(s[2], dict) else {}
+                            titles = [
+                                _norm_match_title(r0.get(k) or "")
+                                for k in ("title", "name", "original_title", "original_name")
+                            ]
+                            if qn and qn in titles:
+                                extra.append(s)
+                        _merge_scored(dest, extra, penalty=30)
             except Exception:
                 pass
-            movie_scored.sort(key=lambda x: -x[0])
-            tv_scored.sort(key=lambda x: -x[0])
+        movie_scored.sort(key=lambda x: -x[0])
+        tv_scored.sort(key=lambda x: -x[0])
 
         movie_has = bool(movie_scored)
         tv_has = bool(tv_scored)
@@ -2299,6 +2441,22 @@ def is_dedicated_movie_leaf(folder: Path) -> bool:
     return False
 
 
+def root_is_single_movie(folder: Path) -> bool:
+    """True when the chosen folder is one film, not a library that also has subfolders.
+
+    One stray video sitting next to many movie folders must not hide the library.
+    Subs / Featurettes do not count as those subfolders.
+    """
+    try:
+        if is_drive_root(folder):
+            return False
+        if not is_dedicated_movie_leaf(folder):
+            return False
+        return not interesting_subdirs(folder)
+    except Exception:
+        return False
+
+
 def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
     """Wrap loose videos only when TMDB can identify the group.
 
@@ -2310,7 +2468,7 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
 
     # skip_wrap_if_root_dedicated_leaf (never for drive roots)
     try:
-        if (not is_drive_root(root)) and is_dedicated_movie_leaf(root):
+        if root_is_single_movie(root):
             return []
     except Exception:
         pass
@@ -2516,7 +2674,7 @@ def collect_candidate_dirs(root: Path):
     untagged_video = []
     # If user selected a single movie folder as root, treat it as a leaf.
     try:
-        if (not is_drive_root(root)) and is_dedicated_movie_leaf(root):
+        if root_is_single_movie(root):
             tid, how = extract_id_from_name(root.name)
             rec = {
                 "path": str(root),
@@ -2643,8 +2801,9 @@ def _try_unique_title_search(leaf: dict, search_cache: dict) -> bool:
         tid, how = search_tmdb(query, year, search_cache, prefer_tid=prefer, prefer_kind=folder_media_hint(name0))
         if not tid:
             continue
-        mode = "auto" if media_is_auto() else ("tv" if media_is_tv() else "movie")
-        cent = search_cache.get("%s|%s|%s|" % (query, year or "", mode)) or {}
+        cent = search_cache.get(
+            _search_cache_key(query, year, prefer, folder_media_hint(name0))
+        ) or {}
         media_hit = cent.get("media") if isinstance(cent, dict) else ""
         if media_hit not in ("movie", "tv"):
             try:
@@ -2820,9 +2979,8 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
             leaf["id_from"] = how
             leaf["search_query"] = query
             leaf["search_year"] = year
-            mode = "auto" if media_is_auto() else ("tv" if media_is_tv() else "movie")
             cent = search_cache.get(
-                "%s|%s|%s|%s|%s" % (query, year or "", mode, _prefer_tid or "", _prefer_kind or "")
+                _search_cache_key(query, year, _prefer_tid or "", _prefer_kind or "")
             )
             media_hit = ""
             if isinstance(cent, dict) and cent.get("media") in ("movie", "tv"):
@@ -2841,8 +2999,9 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
             leaf["media"] = media_hit
             return True
         if how == "ambiguous_movie_and_tv":
-            mode = "auto" if media_is_auto() else ("tv" if media_is_tv() else "movie")
-            cent = search_cache.get("%s|%s|%s|" % (query, year or "", mode)) or {}
+            cent = search_cache.get(
+                _search_cache_key(query, year, _prefer_tid or "", _prefer_kind or "")
+            ) or {}
             leaf["ambiguous"] = True
             leaf["id_from"] = "ambiguous_movie_and_tv"
             leaf["reason"] = "ambiguous_movie_and_tv"
@@ -3941,7 +4100,7 @@ def main():
     print(f"  未能识别编号: {len(unresolved)}", flush=True)
     for u in unresolved[:15]:
         print(
-            f"    ? {u.get('name')[:70]} | {_zh_id_from(u.get('id_from') or 'unresolved')}"
+            f"    ? {(u.get('name') or '')[:70]} | {_zh_id_from(u.get('id_from') or 'unresolved')}"
             f" (搜={u.get('search_query')!r} 年={u.get('search_year')})",
             flush=True,
         )
@@ -3951,7 +4110,7 @@ def main():
     need = [i for i in ids if cache_needs_refetch(cache.get(i) or {})]
     print(f"不重复的电影编号 = {len(ids)}，需要联网获取资料 = {len(need)}", flush=True)
     for n, tid in enumerate(need, 1):
-        fetch_movie(tid, cache, force=True)
+        fetch_movie(tid, cache)
         if n % 25 == 0:
             save_json(CACHE_PATH, cache)
             print(f"  fetched {n}/{len(need)}", flush=True)
@@ -3976,7 +4135,7 @@ def main():
                     meta["year"] = year
                 cache[tid] = meta
         if cache_needs_refetch(meta):
-            fetch_movie(tid, cache, force=True)
+            fetch_movie(tid, cache)
     save_json(CACHE_PATH, cache)
 
     # Multi-disc sibling folders (D1/D2…) sharing parent+tmdb → one folder
@@ -4133,7 +4292,7 @@ def main():
     print(f"跳过原因统计 = { { _zh_reason(k): v for k, v in Counter(s.get('reason') for s in skip).items() } }", flush=True)
     print(f"改名标题语言统计 = {dict(Counter(p.get('lang') for p in plan))}", flush=True)
     for p in plan[:30]:
-        print(f"  [{p.get('id_from')}/{p.get('lang')}]: {p['name'][:65]}", flush=True)
+        print(f"  [{p.get('id_from')}/{p.get('lang')}]: {(p.get('name') or '')[:65]}", flush=True)
         print(f"    -> {p['target'][:80]}", flush=True)
     if len(plan) > 30:
         print(f"  … 另外还有 {len(plan) - 30} 条", flush=True)
