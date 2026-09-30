@@ -121,7 +121,7 @@ REASON_ZH = {
     "ambiguous_no_year": "多个候选且无年份",
     "ambiguous_movie_and_tv": "电影和剧集都匹配到了（请确认）",
     "search_error": "搜索出错",
-    "uncertain_title_only": "不确定：无年份，仅凭片名匹配（未改名）",
+    "uncertain_title_only": "不确定：需要确认（未改名）",
     "empty_query": "查询为空",
     "no_usable_title": "没有可用标题",
     "rename_failed": "改名失败",
@@ -238,7 +238,7 @@ class App(tk.Tk):
         ).pack(anchor="w", padx=8)
         ttk.Label(
             scope,
-            text="没写年份、又有同名候选的，默认不改名，列在「未能匹配」里并写明候选。先预览确认，再勾选。",
+            text="标题对不上、没写年份又有同名候选、或剧集/电影类型对不上的，默认不改名，列在「未能匹配」里并写明原因和候选。先预览确认，再勾选。",
         ).pack(anchor="w", padx=28, pady=(0, 8))
 
         key_row = ttk.Frame(top)
