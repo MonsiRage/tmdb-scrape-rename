@@ -1762,7 +1762,45 @@ def _search_cache_key(q: str, year, prefer_tid: str = "", prefer_kind: str = "")
     prefer_kind = str(prefer_kind or "").strip().lower()
     if prefer_kind not in ("movie", "tv"):
         prefer_kind = ""
-    return f"{q}|{year or ''}|{mode}|{prefer_tid}|{prefer_kind}"
+    return f"{q}|{year or ''}|{mode}|{prefer_tid}|{prefer_kind}|u2"
+
+
+# Set by main() from --accept-uncertain.
+ACCEPT_UNCERTAIN = False
+
+
+def _uncertain_note(q: str, year, chosen_tid, chosen_kind: str, cand_lists: list) -> str:
+    """Why a title-only match (no year in the folder name) is a guess; "" if it is not.
+
+    cand_lists: [(kind, scored)] with scored = [(score, tid, result)].
+    A match is certain only when the folder has a year, or the chosen hit is the
+    only candidate whose title equals the query. Another same-title candidate, a
+    big popularity lead, or a chosen title that is not exactly the query is a guess.
+    """
+    if year and re.fullmatch(r"\d{4}", str(year)):
+        return ""
+    qn = _norm_match_title(q or "")
+    if not qn:
+        return ""
+    chosen_exact = False
+    others = []
+    for kind, scored in cand_lists:
+        for item in scored:
+            tid, r = str(item[1]), item[2]
+            if not isinstance(r, dict):
+                continue
+            if not any(_norm_match_title(r.get(k) or "") == qn for k in ("title", "name", "original_title", "original_name")):
+                continue
+            if tid == str(chosen_tid) and kind == chosen_kind:
+                chosen_exact = True
+            else:
+                yr = str(r.get("release_date") or r.get("first_air_date") or "")[:4]
+                others.append(f"{'电影' if kind == 'movie' else '剧集'}《{r.get('title') or r.get('name') or ''}》({yr or '?'}) [tmdbid={tid}]")
+    if others:
+        return "无年份，仅凭片名匹配；另有同名候选：" + "、".join(others[:3])
+    if not chosen_exact:
+        return "无年份，且搜到的标题与文件夹名不完全一致"
+    return ""
 
 
 def _scored_has_exact(scored: list, q: str) -> bool:
@@ -2001,6 +2039,7 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
                 "query": q,
                 "year": year,
                 "via": how,
+                "uncertain": _uncertain_note(q, year, tid, media, [("movie", movie_scored), ("tv", tv_scored)]),
             }
             return str(tid), how if str(how).startswith("search") else "search"
 
@@ -2164,6 +2203,7 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
         "ok": True, "tmdb": tid, "media": kind,
         "unique": (has_year or len(scored) == 1 or bool(prefer_tid)),
         "query": q, "year": year,
+        "uncertain": _uncertain_note(q, year, tid, kind, [(kind, scored)]),
     }
     return tid, how if how.startswith("search") else "search"
 
@@ -2693,6 +2733,11 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
                 if tid:
                     break
 
+            if tid and not year and not ACCEPT_UNCERTAIN:
+                _cent = search_cache.get(_search_cache_key(query, year, "", folder_media_hint(d.name) or "")) or {}
+                if _cent.get("uncertain"):
+                    tid, how = None, "uncertain_title_only"
+
             if not tid:
                 for vf in files:
                     wrapped.append({
@@ -3118,13 +3163,25 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
         if how == "search_error":
             saw_search_error = True
         if tid:
+            cent = search_cache.get(
+                _search_cache_key(query, year, _prefer_tid or "", _prefer_kind or "")
+            )
+            note = (cent or {}).get("uncertain") if isinstance(cent, dict) else ""
+            if note and not year:
+                leaf["uncertain"] = note
+                if not ACCEPT_UNCERTAIN:
+                    # Title-only guess: report it, do not rename unless confirmed.
+                    leaf["id_from"] = "uncertain_title_only"
+                    leaf["reason"] = "uncertain_title_only"
+                    leaf["note"] = f"{note} | 候选: {(cent or {}).get('media') or ''} [tmdbid={tid}]"
+                    leaf["search_query"] = query
+                    leaf["search_year"] = year
+                    leaf["candidate_tmdb"] = str(tid)
+                    return False
             leaf["tmdb"] = tid
             leaf["id_from"] = how
             leaf["search_query"] = query
             leaf["search_year"] = year
-            cent = search_cache.get(
-                _search_cache_key(query, year, _prefer_tid or "", _prefer_kind or "")
-            )
             media_hit = ""
             if isinstance(cent, dict) and cent.get("media") in ("movie", "tv"):
                 media_hit = cent["media"]
@@ -3948,6 +4005,7 @@ def _zh_reason(code: str) -> str:
         "no_results": "搜索无结果",
         "search_error": "搜索失败",
         "empty_query": "标题为空",
+        "uncertain_title_only": "不确定：无年份，仅凭片名匹配（未改名）",
     }.get(code or "", code or "?")
 
 
@@ -4132,6 +4190,8 @@ def main():
     no_nfo = "--no-nfo" in args
     preview_nfo = "--preview-nfo" in args
     only_new = "--only-new" in args
+    global ACCEPT_UNCERTAIN
+    ACCEPT_UNCERTAIN = "--accept-uncertain" in args
     media = "auto"
     if "--tv" in args or "--media=tv" in args:
         media = "tv"
@@ -4147,7 +4207,7 @@ def main():
     args = [
         a
         for a in args
-        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--tv", "--media=tv", "--media=movie", "--media=auto")
+        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--accept-uncertain", "--tv", "--media=tv", "--media=movie", "--media=auto")
         and not a.startswith("--media=")
     ]
     if not args:
@@ -4478,6 +4538,7 @@ def main():
             "no_results",
             "search_error",
             "empty_query",
+            "uncertain_title_only",
         ) else "no_tmdb_id"
         skip.append({**u, "reason": reason})
 
