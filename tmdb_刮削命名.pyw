@@ -145,7 +145,7 @@ def guess_lib_kind(item: dict, run_media: str = "movie") -> str:
     """
     if not isinstance(item, dict):
         return "tv" if run_media == "tv" else "movie"
-    for key in ("media", "media_kind", "kind_media"):
+    for key in ("media", "media_kind", "kind_media", "media_hint"):
         v = (item.get(key) or "").strip().lower()
         if v in ("tv", "show", "series", "剧集"):
             return "tv"
@@ -513,7 +513,15 @@ class App(tk.Tk):
                 )
                 self.overview_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
             else:
+                if key == "unmatched":
+                    ttk.Label(
+                        fr,
+                        text="双击一行：从候选里选一个（或填 TMDB 编号），选完再点「仅预览」/「确认刮削」就会按你的选择处理。",
+                        foreground="#555",
+                    ).pack(anchor="w", padx=8, pady=(6, 0))
                 self.tab_trees[key] = self._make_scrollable_tree(fr)
+                if key == "unmatched":
+                    self.tab_trees[key].bind("<Double-1>", lambda e, t=self.tab_trees[key]: self._pick_candidate(t))
 
         self._run(root, preview, media)
 
@@ -527,6 +535,9 @@ class App(tk.Tk):
         tree = self.tab_trees.get(key)
         if not tree:
             return
+        if hasattr(self, "_row_items"):
+            for k in [k for k in self._row_items if k[0] == key]:
+                self._row_items.pop(k, None)
         for item in tree.get_children():
             tree.delete(item)
 
@@ -534,12 +545,94 @@ class App(tk.Tk):
         self._clear_tree(key)
         tree = self.tab_trees[key]
         kind = "剧集" if getattr(self, "_media", "movie") == "tv" else "电影"
+        if not hasattr(self, "_row_items"):
+            self._row_items = {}
         for row in rows:
             if len(row) >= 4:
-                tree.insert("", tk.END, values=(row[0], row[1], row[2], row[3]))
+                iid = tree.insert("", tk.END, values=(row[0], row[1], row[2], row[3]))
+                if len(row) >= 5 and isinstance(row[4], dict):
+                    self._row_items[(key, iid)] = row[4]
             else:
                 a, b, c = row[0], row[1], row[2]
                 tree.insert("", tk.END, values=(kind, a, b, c))
+
+    def _pick_candidate(self, tree: ttk.Treeview) -> None:
+        """Double-click on a row of 未能匹配: choose the right TMDB entry for that folder."""
+        sel = tree.selection()
+        if not sel:
+            return
+        item = getattr(self, "_row_items", {}).get(("unmatched", sel[0]))
+        if not item or not item.get("path"):
+            self._copy_tree_row(tree)
+            return
+        cands = [c for c in (item.get("candidates") or []) if isinstance(c, dict) and str(c.get("tmdb") or "").isdigit()]
+
+        top = tk.Toplevel(self)
+        top.title("选择正确的影片")
+        top.transient(self)
+        top.geometry("760x460")
+        ttk.Label(top, text=str(item.get("name") or ""), font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 0))
+        ttk.Label(top, text=str(item.get("path") or ""), foreground="#555").pack(anchor="w", padx=12)
+        why = item.get("note") or ""
+        ttk.Label(top, text=f"原因：{zh_reason(item.get('reason') or '')}", foreground="#a33").pack(anchor="w", padx=12, pady=(6, 0))
+        if why:
+            ttk.Label(top, text=str(why)[:400], wraplength=720, justify="left", foreground="#555").pack(anchor="w", padx=12)
+
+        var = tk.StringVar(value="0" if cands else "manual")
+        box = ttk.LabelFrame(top, text="候选")
+        box.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        for i, c in enumerate(cands):
+            where = "·".join(x for x in (c.get("year"), c.get("country") or c.get("lang")) if x)
+            kind_zh = "电影" if c.get("media") == "movie" else "剧集"
+            text = f"{kind_zh}《{c.get('title') or c.get('original') or ''}》({where or '?'})  原名：{c.get('original') or ''}  [tmdbid={c.get('tmdb')}]"
+            ttk.Radiobutton(box, text=text, variable=var, value=str(i)).pack(anchor="w", padx=8, pady=2)
+        if not cands:
+            ttk.Label(box, text="没有候选，可以直接填 TMDB 编号。").pack(anchor="w", padx=8, pady=2)
+        manual = ttk.Frame(box)
+        manual.pack(anchor="w", padx=8, pady=(8, 2))
+        ttk.Radiobutton(manual, text="自己填：", variable=var, value="manual").pack(side=tk.LEFT)
+        mtype = tk.StringVar(value=(item.get("media") or "movie") if (item.get("media") in ("movie", "tv")) else "movie")
+        ttk.Radiobutton(manual, text="电影", variable=mtype, value="movie").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Radiobutton(manual, text="剧集", variable=mtype, value="tv").pack(side=tk.LEFT, padx=(8, 0))
+        mid = tk.StringVar()
+        ttk.Entry(manual, textvariable=mid, width=12).pack(side=tk.LEFT, padx=8)
+        ttk.Label(manual, text="TMDB 编号（网页地址 /movie/ 或 /tv/ 后面的数字）", foreground="#555").pack(side=tk.LEFT)
+
+        def ok() -> None:
+            if var.get() == "manual":
+                tid = mid.get().strip()
+                if not tid.isdigit():
+                    messagebox.showerror("编号无效", "请填数字编号。", parent=top)
+                    return
+                choice = {"tmdb": tid, "media": mtype.get()}
+            else:
+                c = cands[int(var.get())]
+                choice = {"tmdb": str(c["tmdb"]), "media": c.get("media") or "movie"}
+            self._save_choice(item, choice)
+            top.destroy()
+
+        bar = ttk.Frame(top)
+        bar.pack(fill=tk.X, padx=12, pady=(0, 10))
+        ttk.Button(bar, text="取消", command=top.destroy).pack(side=tk.RIGHT)
+        ttk.Button(bar, text="确定", command=ok).pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _save_choice(self, item: dict, choice: dict) -> None:
+        """Remember the choice for this folder; the engine reads it on the next run."""
+        path = data_dir() / "tmdb_user_choices.json"
+        data = {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:
+            data = {}
+        key = str(item.get("path") or "").replace("/", "\\").rstrip("\\").lower()
+        data[key] = {**choice, "name": item.get("name") or "", "path": str(item.get("path") or "")}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
+            return
+        messagebox.showinfo("已记住", "已记住你的选择。\n再点一次「仅预览」或「确认刮削」，这个文件夹就会按它处理。")
 
     def _confirm_apply(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -803,7 +896,10 @@ class App(tk.Tk):
                 or item.get("video")
                 or ""
             )
-            return (kind, name, zh_reason(reason), note)
+            reason_zh = zh_reason(reason)
+            if reason == "ambiguous_no_year" and item.get("search_year"):
+                reason_zh = "多个候选（同名同年）"
+            return (kind, name, reason_zh, note, item)
 
         um_rows = []
         for s in unmatched:

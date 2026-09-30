@@ -3323,11 +3323,20 @@ def _path_key(path) -> str:
 
 def load_user_choices() -> dict:
     """Drop choices whose folder no longer exists (it was renamed after the choice was used)."""
-    data = load_json(TOOLS / "tmdb_user_choices.json")
+    path = TOOLS / "tmdb_user_choices.json"
+    data = load_json(path)
     out = {}
     for k, v in (data or {}).items():
-        if isinstance(v, dict) and str(v.get("tmdb") or "").isdigit() and v.get("media") in ("movie", "tv"):
-            out[k] = v
+        if not (isinstance(v, dict) and str(v.get("tmdb") or "").isdigit() and v.get("media") in ("movie", "tv")):
+            continue
+        if v.get("path") and not Path(v["path"]).exists():
+            continue  # the folder was renamed: the choice has been used
+        out[k] = v
+    if out != (data or {}):
+        try:
+            save_json(path, out)
+        except Exception:
+            pass
     return out
 
 
@@ -3506,6 +3515,7 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
             leaf["year_from"] = "files"
     region = region_hint(leaf.get("name") or "", *stems[:3])
     region_key = (region or {}).get("key", "")
+    leaf["media_hint"] = _leaf_media_hint(leaf) or ""
     # Search names: leaf itself, cleaned leaf, and parent folder (multi-disc D1/D2
     # often have short codes like TJ_GOLDEN_ERA_ANTHOLOGY_D1 while the parent has
     # the real title).
