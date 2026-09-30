@@ -17,6 +17,7 @@
 - **下载图片（仅当 TMDB 上有时）**：`poster.jpg`（海报）、`fanart.jpg`（背景）、`clearlogo.png`（logo）。不会伪造 folder.jpg / banner / landscape 等 TMDB 没有的图。
 - **写 Emby nfo**：文件夹里**还没有任何 nfo** 时才写（命名为 `视频文件名.nfo`，没有视频时为 `movie.nfo`）；已有的 nfo 绝不覆盖或删除。
 - **离线网页快照**：在每个影片文件夹生成 `tmdb.html`，一个类似 TMDB 详情页的离线页面（海报、logo、标题、简介、类型、片长、导演、制片、国家、系列、演员、TMDB / IMDb 链接），图片引用同文件夹里的 poster / fanart / clearlogo。
+- **出错不冒充“没结果”**：开跑前先验证 API Key；搜索时遇到网络 / API 错误会标为「搜索失败」，不会当成「搜索无结果」，也不写进搜索缓存，重跑即可。
 - **预览 / 正式两种模式**：预览模式只显示计划（改名、下载、写 nfo、写网页），不改任何文件；正式模式才真正执行。
 - **只刮削新添加的**：首页默认勾选。名字里已经有 `[tmdbid=编号]` 的文件夹直接跳过，不联网、不改名、不补图。取消勾选才会把整库再检查一遍。新片子请放成新文件夹，不要丢进已经带编号的旧文件夹。
 
@@ -32,14 +33,7 @@ pythonw tmdb_刮削命名.pyw
 
 不想装 Python 的话，可以去 [Releases](../../releases) 页面下载打包好的 Windows exe（`TMDB-scrape-rename.exe`）。exe 内置引擎，修改旁边的 .py 不会生效。API Key 和 JSON 缓存在 `%AppData%\Roaming\TMDB刮削命名`，也可以用环境变量 `TMDB_API_KEY`。
 
-### 2. bat 一键运行
-
-把 `tmdb_命名预览.bat` / `tmdb_命名.bat` 和 `tmdb_format_rename.py` 放进要整理的影片根目录，双击：
-
-- `tmdb_命名预览.bat`：只预览，不改文件
-- `tmdb_命名.bat`：正式改名 + 下载图片 + 写 nfo + 生成 tmdb.html
-
-### 3. 命令行
+### 2. 命令行
 
 ```
 python tmdb_format_rename.py "D:\影片"              # 正式执行
@@ -56,7 +50,7 @@ python tmdb_format_rename.py "D:\影片" --media=tv   # 按剧集处理（也可
 
 ## TMDB API key（必需）
 
-程序**不内置 key**，请使用你自己的 TMDB API key（在 TMDB 账号设置 → API 里免费申请，使用 v3 的 API Key）：
+程序**不内置 key**（找不到 key 时会直接报错退出），请使用你自己的 TMDB API key（在 TMDB 账号设置 → API 里免费申请，使用 v3 的 API Key）：
 
 1. 在程序首页的 **TMDB API Key** 输入框里粘贴。点「仅预览」或「确认刮削」时写入 `%AppData%\Roaming\TMDB刮削命名\tmdb_api_key.txt`，不会写进日志；已有该文件会自动填入。或者
 2. 直接在那个目录新建 `tmdb_api_key.txt`，第一行写入你的 key；或者

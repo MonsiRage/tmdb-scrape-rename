@@ -132,7 +132,7 @@ def _load_api_key() -> str:
                     return v.splitlines()[0].strip()
         except Exception:
             pass
-    return "8265bd1679663a7ea12ac168da84d2e8"
+    return ""
 
 
 API_KEY = _load_api_key()
@@ -577,21 +577,34 @@ def api_get(url: str, retries: int = 4):
                 time.sleep(ra if ra > 0 else min(8.0, 1.5 * rate_tries))
                 continue
             attempt += 1
-            if attempt >= retries:
+            if e.code in (401, 404):
+                # Definitive answers (bad key / no such id): no point retrying.
                 err = {"_error": f"HTTP {e.code}"}
                 _URL_CACHE[url] = err
                 return err
+            if attempt >= retries:
+                # Transient (5xx, ...): report, but do not cache for the run.
+                return {"_error": f"HTTP {e.code}"}
             time.sleep(0.6 * attempt)
         except Exception as e:
             attempt += 1
             if attempt >= retries:
-                err = {"_error": str(e)}
-                _URL_CACHE[url] = err
-                return err
+                return {"_error": str(e)}
             time.sleep(0.6 * attempt)
-    err = {"_error": "unknown"}
-    _URL_CACHE[url] = err
-    return err
+    return {"_error": "unknown"}
+
+
+def check_api_key() -> tuple[bool, str]:
+    """Ask TMDB once whether the key works. Returns (ok, message in Chinese)."""
+    if not API_KEY:
+        return False, "没有 TMDB API Key。请在程序首页填写，或设置环境变量 TMDB_API_KEY。"
+    data = api_get(f"https://api.themoviedb.org/3/configuration?api_key={API_KEY}")
+    err = str((data or {}).get("_error") or "")
+    if not err:
+        return True, ""
+    if err == "HTTP 401":
+        return False, "TMDB API Key 无效（HTTP 401）。请检查是否使用 v3 的 API Key。"
+    return False, f"连不上 TMDB（{err}）。请检查网络 / 代理后重试。"
 
 
 def load_json(path: Path) -> dict:
@@ -1639,6 +1652,11 @@ def extract_id_from_name(name: str):
     return None, None
 
 
+# Bumped whenever a TMDB search request ends in an API/network error, so a
+# failed lookup can be told apart from a genuine "no results".
+_SEARCH_FAILS = [0]
+
+
 def _search_tmdb_one_kind(kind: str, q: str, year: str | None):
     """Search one TMDB endpoint; return scored list of (score, tid, result).
 
@@ -1662,6 +1680,7 @@ def _search_tmdb_one_kind(kind: str, q: str, year: str | None):
             params.pop("first_air_date_year", None)
             data = api_get(f"https://api.themoviedb.org/3/search/{kind}?" + urllib.parse.urlencode(params))
     if not isinstance(data, dict) or data.get("_error"):
+        _SEARCH_FAILS[0] += 1
         return []
     results = data.get("results") or []
     scored = []
@@ -1744,6 +1763,23 @@ def _merge_scored(dest: list, extra: list, penalty: int = 0) -> None:
 
 
 def search_tmdb(query: str, year: str | None, search_cache: dict, prefer_tid: str | None = None, prefer_kind: str | None = None):
+    """Return (tmdb_id, how). A search that hit API/network errors and found
+    nothing is reported as "search_error" (and not cached), never "no_results".
+    """
+    fails0 = _SEARCH_FAILS[0]
+    tid, how = _search_tmdb_impl(query, year, search_cache, prefer_tid, prefer_kind)
+    if not tid and how == "no_results" and _SEARCH_FAILS[0] > fails0:
+        pt = str(prefer_tid or "").strip()
+        pk = str(prefer_kind or "").strip().lower()
+        search_cache.pop(
+            _search_cache_key((query or "").strip(), year, pt if pt.isdigit() else "", pk if pk in ("movie", "tv") else ""),
+            None,
+        )
+        return None, "search_error"
+    return tid, how
+
+
+def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_tid: str | None = None, prefer_kind: str | None = None):
     """Return (tmdb_id, how).
 
     Auto mode cascade when title collides:
@@ -4123,6 +4159,10 @@ def main():
     print("=" * 60, flush=True)
     if not root.exists() or not root.is_dir():
         print("错误：扫描目录不存在，或不是文件夹", flush=True)
+        return 2
+    key_ok, key_msg = check_api_key()
+    if not key_ok:
+        print(f"错误：{key_msg}", flush=True)
         return 2
 
     print("正在整理散落的视频（预览时只显示计划）...", flush=True)
