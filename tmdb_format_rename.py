@@ -192,6 +192,37 @@ _HINT_ONLY = re.compile(
 )
 
 
+# Season / episode markers that are not part of a title: S01, S01-S02, S01E02,
+# Season 1, 第一季, 全3季. (Only 季: 第2部 can be a movie sequel.)
+_SEASON_TOKENS = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:S\d{1,2}(?:[\s._]*[-–~][\s._]*S?\d{1,2})?"
+    r"(?:[\s._]*E\d{1,3}(?:[\s._]*[-–~]?[\s._]*E?\d{1,3})?)?"
+    r"|Seasons?[\s._]*\d{1,2}(?:[\s._]*[-–~][\s._]*\d{1,2})?|Complete[\s._]*Series)(?![A-Za-z0-9])"
+    r"|第\s*[一二三四五六七八九十百零两\d]+(?:\s*[-–~至到]\s*[一二三四五六七八九十百零两\d]+)?\s*季"
+    r"|全\s*[一二三四五六七八九十\d]+\s*季"
+)
+
+
+def strip_season_tokens(s: str) -> str:
+    return _SEASON_TOKENS.sub(" ", s or "")
+
+
+_SEASON_DIR_RE = re.compile(
+    r"(?i)^(?:s\d{1,2}|season[\s._-]*\d{1,2}|series[\s._-]*\d{1,2}|第\s*[一二三四五六七八九十百零两\d]+\s*季|specials?|特别篇|特典)$"
+)
+_EPISODE_RE = re.compile(
+    r"(?i)(?:^|[\s._\-\[\(])(?:S\d{1,2}[\s._]*E\d{1,3}|\d{1,2}x\d{2,3}|EP?[\s._]*\d{2,3}|第\s*\d{1,3}\s*[集话話])(?:$|[\s._\-\]\)])"
+)
+
+
+def is_season_dir_name(name: str) -> bool:
+    return bool(_SEASON_DIR_RE.match((name or "").strip()))
+
+
+def looks_like_episode_file(stem: str) -> bool:
+    return bool(_EPISODE_RE.search(stem or ""))
+
+
 def folder_media_hint(name: str) -> str | None:
     """Folder-name type hint: 'tv' / 'movie' / None.
 
@@ -1316,7 +1347,7 @@ def strip_release_junk(s: str) -> str:
 
 
 def clean_query_title(name: str) -> str:
-    s = name or ""
+    s = strip_season_tokens(name or "")
     s = strip_media_hint_tokens(s)
     s = strip_release_junk(s)
     s = TMDB_RE.sub(" ", s)
@@ -1377,6 +1408,7 @@ def extract_search_queries(name: str) -> list[str]:
 
     Tries Chinese bracket titles, Latin show/movie names, then a cleaned full string.
     """
+    name = strip_season_tokens(name or "")
     # collapse_dotted_acronym
     # leading_num_title_query: 3.from.Hell -> 3 from Hell
     name = re.sub(r"^(\d{1,2})[._\- ]+(?=[A-Za-z])", r"\1 ", (name or "").strip())
@@ -2048,7 +2080,11 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
                 "query": q,
                 "year": year,
                 "via": how,
-                "uncertain": _uncertain_note(q, year, tid, media, [("movie", movie_scored), ("tv", tv_scored)]),
+                "uncertain": _uncertain_note(
+                    q, year, tid, media,
+                    # A folder hint (S01, 电视剧, ...) settles the side: only rivals on it count.
+                    [(k, sc) for k, sc in (("movie", movie_scored), ("tv", tv_scored)) if prefer_kind not in ("movie", "tv") or k == prefer_kind],
+                ),
             }
             return str(tid), how if str(how).startswith("search") else "search"
 
@@ -2081,7 +2117,7 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
                                 continue
                             r0 = s[2] if isinstance(s[2], dict) else {}
                             rd = str(r0.get("release_date") or r0.get("first_air_date") or "")[:4]
-                            if not rd.isdigit() or abs(int(rd) - y0) > 5 or abs(int(rd) - y0) == 0:
+                            if not rd.isdigit() or abs(int(rd) - y0) != 1:
                                 continue
                             titles = [_norm_match_title(r0.get(k) or "") for k in ("title", "name", "original_title", "original_name")]
                             if qn and qn in titles:
@@ -2684,6 +2720,9 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
             continue
         if is_collection_dir(d.name):
             continue
+        # TV: episode files (S01E02, 第3集) and Season folders are not loose movies.
+        if is_season_dir_name(d.name) or any(looks_like_episode_file(v.stem) for v in videos):
+            continue
         # Dedicated movie leaf (incl. multi-ISO anthology): never treat as loose,
         # even when the scan root *is* that folder.
         if is_dedicated_movie_leaf(d):
@@ -2917,6 +2956,18 @@ def collect_candidate_dirs(root: Path):
                     subdirs = [x for x in child.iterdir() if x.is_dir() and not should_prune(x.name)]
                 except Exception:
                     subdirs = []
+                # A show folder whose subfolders are Season 01 / S02 / 第一季 ...: the show
+                # folder is the leaf, not each season.
+                season_subs = [x for x in subdirs if is_season_dir_name(x.name)]
+                if season_subs and not has_video(child) and len(season_subs) == len([x for x in subdirs if not is_extras_dir(x.name)]):
+                    untagged_video.append({
+                        "path": str(child),
+                        "name": child.name,
+                        "parent": str(child.parent),
+                        "kind": "tv_show",
+                        "media": "tv",
+                    })
+                    continue
                 if SERIES.search(child.name) or (subdirs and not has_video(child)):
                     stack.append(child)
                     continue
@@ -3003,6 +3054,21 @@ def _try_unique_title_search(leaf: dict, search_cache: dict) -> bool:
         leaf.pop("reason", None)
         return True
     return False
+
+
+def _leaf_media_hint(leaf: dict) -> str | None:
+    """'tv'/'movie'/None for a leaf: name hint, a Season-folder show, or episode files."""
+    hint = folder_media_hint(leaf.get("name") or "")
+    if hint:
+        return hint
+    if leaf.get("kind") == "tv_show":
+        return "tv"
+    try:
+        if any(looks_like_episode_file(v.stem) for v in list_videos_in_dir(Path(leaf.get("path") or ""))):
+            return "tv"
+    except Exception:
+        pass
+    return None
 
 
 def resolve_leaf_id(leaf: dict, search_cache: dict):
@@ -3144,7 +3210,10 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
     # the source has a sequel mark (强奸男2 / 聚会的目的2). Then prefer longer.
     # The parent's trailing digit (a library root called "Movies2") is not a sequel
     # mark of this leaf; only count it when the parent is what we are searching.
-    src_mark = sequel_mark(leaf.get("name") or "") or (sequel_mark(parent_name or "") if parent_queries and not has_own_queries else "")
+    # Season markers (S01, 第一季) are not sequel marks of a title.
+    src_mark = sequel_mark(strip_season_tokens(leaf.get("name") or "")) or (
+        sequel_mark(strip_season_tokens(parent_name or "")) if parent_queries and not has_own_queries else ""
+    )
     def _q_rank(q: str):
         junk = 1 if re.search(r"\d{4}\s*[–—\-]\s*\d{4}", q) or re.search(r"\b(?:19|20)\d{2}\b", q) else 0
         has_seq = 0 if (src_mark and query_has_sequel(q, src_mark)) or sequel_mark(q) else 1
@@ -3167,7 +3236,7 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
         if src_mark and not query_has_sequel(query, src_mark) and not sequel_mark(query):
             continue
         _prefer_tid = str(leaf.get("prefer_tmdb") or leaf.get("tmdb") or "") or None
-        _prefer_kind = folder_media_hint(leaf.get("name") or "")
+        _prefer_kind = _leaf_media_hint(leaf)
         tid, how = search_tmdb(query, year, search_cache, prefer_tid=_prefer_tid, prefer_kind=_prefer_kind)
         last_how, last_query = how, query
         if how == "search_error":
@@ -3248,7 +3317,7 @@ def _download_bytes(url: str, dest: Path, min_size: int = 500) -> str:
         return "already_exists"
     tmp = dest.with_suffix(dest.suffix + ".part")
     last_err = ""
-    for attempt in range(1, 4):
+    for attempt in range(1, 5):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA, "Connection": "keep-alive"})
             with urllib.request.urlopen(req, timeout=60) as r:
@@ -3337,7 +3406,7 @@ def _cdata_plot(plot: str) -> str:
     return f"<![CDATA[{s}]]>"
 
 
-def build_nfo_xml(meta: dict, tid: str) -> str:
+def build_nfo_xml(meta: dict, tid: str, root: str = "movie") -> str:
     title = meta.get("picked_title") or meta.get("title_zh") or meta.get("title_en") or ""
     original = meta.get("original_title") or ""
     year = meta.get("year") or ""
@@ -3366,7 +3435,7 @@ def build_nfo_xml(meta: dict, tid: str) -> str:
 
     lines = [
         '<?xml version="1.0" encoding="utf-8" standalone="yes"?>',
-        "<movie>",
+        f"<{root}>",
         f"  <plot>{_cdata_plot(plot)}</plot>",
         "  <outline />",
         "  <lockdata>false</lockdata>",
@@ -3479,7 +3548,7 @@ def build_nfo_xml(meta: dict, tid: str) -> str:
     lines.append("  <fileinfo>")
     lines.append("    <streamdetails />")
     lines.append("  </fileinfo>")
-    lines.append("</movie>")
+    lines.append(f"</{root}>")
     lines.append("")
     return "\n".join(lines)
 
@@ -3687,12 +3756,23 @@ def write_tmdb_html(folder: Path, meta: dict, tid: str, preview: bool = False) -
         return f"err:{e}"
 
 
-def write_movie_nfo(folder: Path, meta: dict, tid: str, preview: bool = False) -> str:
+def write_movie_nfo(folder: Path, meta: dict, tid: str, preview: bool = False, kind: str = "movie") -> str:
     """Write Emby nfo as {video_filename}.nfo only when folder has no existing nfo.
 
     Existing Emby/other nfo is never overwritten or deleted.
+    A TV show gets one tvshow.nfo (written unless one exists); episode nfos are left alone.
     """
     videos = list_videos_in_dir(folder)
+    if kind == "tv":
+        if (folder / "tvshow.nfo").exists():
+            return "already_has_nfo"
+        if preview:
+            return "would_write_nfo:tvshow.nfo"
+        try:
+            (folder / "tvshow.nfo").write_text(build_nfo_xml(meta, tid, root="tvshow"), encoding="utf-8")
+            return "ok:tvshow.nfo"
+        except Exception as e:
+            return f"err:{e}"
     if folder_has_nfo(folder):
         if preview:
             return "already_has_nfo"
@@ -3807,7 +3887,7 @@ def apply_artwork_and_nfo(
             art_summary = ";".join(f"{k}={v}" for k, v in results.items())
 
         if write_nfo_now:
-            nfo_st = write_movie_nfo(folder, meta, str(tid), preview=preview and not preview_nfo)
+            nfo_st = write_movie_nfo(folder, meta, str(tid), preview=preview and not preview_nfo, kind=_k)
             # if preview_nfo during preview: actually write; if apply: write
             if preview and not preview_nfo:
                 nfo_st = "would_write_nfo"
