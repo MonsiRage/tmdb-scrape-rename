@@ -178,8 +178,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("TMDB 刮削命名")
-        self.geometry("760x430")
-        self.minsize(640, 400)
+        self.geometry("760x560")
+        self.minsize(680, 520)
         self.tools = find_tools_dir()
         self.script = self.tools / "tmdb_format_rename.py"
         self.proc = None
@@ -216,6 +216,19 @@ class App(tk.Tk):
         ttk.Entry(row, textvariable=self.root_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         ttk.Button(row, text="浏览…", command=self._browse).pack(side=tk.LEFT)
 
+        scope = ttk.LabelFrame(top, text="刮削范围")
+        scope.pack(fill=tk.X, pady=(0, 10))
+        self.only_new_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            scope,
+            text="只刮削新添加的",
+            variable=self.only_new_var,
+        ).pack(anchor="w", padx=8, pady=(6, 0))
+        ttk.Label(
+            scope,
+            text="勾选后，跳过名字里已有 [tmdbid=] 的文件夹。取消勾选，则整库重新检查。",
+        ).pack(anchor="w", padx=28, pady=(0, 8))
+
         key_row = ttk.Frame(top)
         key_row.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(key_row, text="TMDB API Key").pack(side=tk.LEFT)
@@ -237,12 +250,6 @@ class App(tk.Tk):
             text="每次同时搜索电影与剧集：只命中一边进对应标签；重复或刮削不到的都进「未能匹配」（说明写在行内）。",
             foreground="#666",
         ).pack(anchor="w", pady=(0, 8))
-        self.only_new_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            top,
-            text="只刮削新添加的（跳过名字里已有 [tmdbid=] 的文件夹，不联网、不改文件）",
-            variable=self.only_new_var,
-        ).pack(anchor="w", pady=(0, 12))
 
         btns = ttk.Frame(top)
         btns.pack(fill=tk.X, pady=(4, 8))
@@ -261,6 +268,15 @@ class App(tk.Tk):
         path = filedialog.askdirectory(initialdir=self.root_var.get() or str(Path.home()))
         if path:
             self.root_var.set(path)
+
+    def _sync_only_new(self) -> None:
+        var = getattr(self, "only_new_var", None)
+        if var is None:
+            return
+        try:
+            self._only_new = bool(var.get())
+        except Exception:
+            self._only_new = True
 
     def _toggle_api_key(self) -> None:
         self._api_key_entry.configure(show="" if self._show_key.get() else "*")
@@ -415,6 +431,13 @@ class App(tk.Tk):
             text=(("预览" if preview else "正式刮削") + f"  ·  【{media_zh}】  ·  {root}"),
             font=("Microsoft YaHei UI", 10, "bold"),
         ).pack(side=tk.LEFT)
+        self.only_new_var = tk.BooleanVar(value=bool(getattr(self, "_only_new", True)))
+        ttk.Checkbutton(
+            bar,
+            text="只刮削新添加的",
+            variable=self.only_new_var,
+            command=self._sync_only_new,
+        ).pack(side=tk.LEFT, padx=(16, 0))
 
         self.btn_stop = ttk.Button(bar, text="停止", command=self._stop)
         self.btn_stop.pack(side=tk.RIGHT)
@@ -835,7 +858,7 @@ class App(tk.Tk):
             return
         for w in self.winfo_children():
             w.destroy()
-        self.geometry("760x430")
+        self.geometry("760x560")
         self.title("TMDB 刮削命名")
         self._scan_root = None
         self._last_was_preview = False
@@ -852,6 +875,7 @@ class App(tk.Tk):
                 "请回到首页填写 TMDB API Key。\n它会保存在 %AppData%\\Roaming\\TMDB刮削命名\\tmdb_api_key.txt。",
             )
             return
+        self._sync_only_new()
         os.environ["TMDB_TOOLS_DIR"] = str(data_dir())
         os.environ["PYTHONIOENCODING"] = "utf-8"
         frozen = bool(getattr(sys, "frozen", False))
