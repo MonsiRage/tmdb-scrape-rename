@@ -862,9 +862,17 @@ def cache_needs_refetch(entry: dict) -> bool:
 
 
 
+def ckey(tid, kind: str | None = None) -> str:
+    """Metadata cache key. A movie and a TV show can share one numeric id, so a
+    show is stored as 'tv:<id>'; movies (and unknown kinds) keep the bare id."""
+    return f"tv:{tid}" if kind == "tv" else str(tid)
+
+
 def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = None) -> dict:
-    if not force and tid in cache and not cache_needs_refetch(cache[tid]):
-        c = cache[tid]
+    tid = str(tid)
+    ck = ckey(tid, kind)
+    if not force and ck in cache and not cache_needs_refetch(cache[ck]):
+        c = cache[ck]
         if c.get("title_zh") is not None or c.get("title_en") is not None:
             return c
 
@@ -878,6 +886,7 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
                 kind = "movie"
         else:
             kind = "tv" if media_is_tv() else "movie"
+    ck = ckey(tid, kind)
     append = (
         "&append_to_response=credits,external_ids,content_ratings,videos,images"
         if kind == "tv"
@@ -929,10 +938,10 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
     if kind == "tv":
         base = _normalize_tv_payload(base)
     if not isinstance(base, dict) or base.get("_error"):
-        cache[tid] = {"ok": False, "error": (base or {}).get("_error")}
-        if isinstance(cache.get(tid), dict) and kind in ("movie", "tv"):
-            cache[tid]["kind"] = kind
-        return cache[tid]
+        cache[ck] = {"ok": False, "error": (base or {}).get("_error")}
+        if isinstance(cache.get(ck), dict) and kind in ("movie", "tv"):
+            cache[ck]["kind"] = kind
+        return cache[ck]
 
     picked, year, lang = pick_from_langs(zh, tw, hk, en, base)
     poster = ""
@@ -1173,7 +1182,7 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
             tvdb_id = str(ext.get("tvdb_id"))
             break
 
-    cache[tid] = {
+    cache[ck] = {
         "ok": bool(picked),
 
         "tmdb": tid,
@@ -1214,11 +1223,11 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
         "nfo_ver": 3,
     }
     if not picked:
-        cache[tid]["ok"] = False
-        cache[tid]["error"] = "empty_title"
-    if isinstance(cache.get(tid), dict) and kind in ("movie", "tv"):
-        cache[tid]["kind"] = kind
-    return cache[tid]
+        cache[ck]["ok"] = False
+        cache[ck]["error"] = "empty_title"
+    if isinstance(cache.get(ck), dict) and kind in ("movie", "tv"):
+        cache[ck]["kind"] = kind
+    return cache[ck]
 
 
 def extract_year(name: str):
@@ -2934,7 +2943,7 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
                 cache = load_json(CACHE_PATH)
                 _cent = search_cache.get(_search_cache_key(query, year, "", folder_media_hint(d.name) or "")) or {}
                 _mk = _cent.get("media") if _cent.get("media") in ("movie", "tv") else None
-                meta = fetch_movie(str(tid), cache, force=bool(_mk and cache.get(str(tid), {}).get("kind") not in (None, _mk)), kind=_mk)
+                meta = fetch_movie(str(tid), cache, kind=_mk)
                 save_json(CACHE_PATH, cache)
                 if isinstance(meta, dict) and meta.get("ok") and meta.get("picked_title"):
                     title_for_folder = meta.get("picked_title") or title_for_folder
@@ -3963,7 +3972,7 @@ def apply_artwork_and_nfo(
     do_nfo: bool = True,
     preview_nfo: bool = False,
 ):
-    """folders_and_ids: list of (folder_path_str, tmdb_id)."""
+    """folders_and_ids: list of (folder_path_str, tmdb_id[, 'movie'|'tv'])."""
     art_stats = {"ok": 0, "skip": 0, "fail": 0}
     nfo_stats = {"ok": 0, "skip": 0, "fail": 0}
     html_stats = {"ok": 0, "skip": 0, "fail": 0}
@@ -3974,19 +3983,21 @@ def apply_artwork_and_nfo(
     # first, then let the loop below report what happened.
     art_prefetched: dict = {}
     if do_poster and not preview:
-        def _dl(pair):
-            folder_s, tid = pair
-            meta0 = cache.get(str(tid)) or {}
+        def _dl(item):
+            folder_s, tid = item[0], item[1]
+            meta0 = cache.get(ckey(tid, item[2] if len(item) > 2 else None)) or {}
             if meta0.get("picked_title") and meta0.get("poster_path"):
                 return folder_s, download_artwork(Path(folder_s), meta0, preview=False)
             return folder_s, None
         art_prefetched = {k: v for k, v in _pmap(_dl, folders_and_ids) if v is not None}
 
-    for folder_s, tid in folders_and_ids:
+    for item in folders_and_ids:
+        folder_s, tid = item[0], item[1]
+        known_kind = item[2] if len(item) > 2 and item[2] in ("movie", "tv") else None
         folder = Path(folder_s)
-        meta = cache.get(str(tid)) or {}
+        meta = cache.get(ckey(tid, known_kind)) or {}
         # Per-item movie/tv — do not rely on global mode alone.
-        _k = (meta.get("kind") or meta.get("media") or "").strip().lower()
+        _k = (known_kind or meta.get("kind") or meta.get("media") or "").strip().lower()
         if _k not in ("movie", "tv"):
             try:
                 _k = classify_tmdb_id_kind(str(tid), folder.name) or ""
@@ -3998,10 +4009,10 @@ def apply_artwork_and_nfo(
             try:
                 meta = fetch_movie(str(tid), cache, force=True, kind=_k)
             except Exception:
-                meta = cache.get(str(tid)) or meta
+                meta = cache.get(ckey(tid, _k)) or meta
         if isinstance(meta, dict):
             meta["kind"] = _k
-            cache[str(tid)] = meta
+            cache[ckey(tid, _k)] = meta
         art_summary = ""
         nfo_st = ""
 
@@ -4567,6 +4578,16 @@ def main():
     search_cache = load_json(SEARCH_CACHE_PATH)
     leaves = list(tagged)
     unresolved = []
+    if media_is_auto() and tagged:
+        # [tmdbid=N] folders: a movie and a TV show can share N, so decide which one
+        # this folder is (by its title) instead of assuming.
+        tag_ok = _pmap(lambda L: resolve_leaf_id(L, search_cache), tagged)
+        leaves = [L for L, ok in zip(tagged, tag_ok) if ok]
+        for L, ok in zip(tagged, tag_ok):
+            if not ok:
+                if not L.get("reason"):
+                    L["reason"] = L.get("id_from") or "unresolved"
+                unresolved.append(L)
     resolved = _pmap(lambda u: resolve_leaf_id(u, search_cache), untagged)
     for u, ok in zip(untagged, resolved):
         if ok:
@@ -4610,27 +4631,19 @@ def main():
         )
 
     cache = load_json(CACHE_PATH)
-    ids = sorted({L["tmdb"] for L in leaves if L.get("tmdb")})
-    # A movie and a TV show can share one numeric id. Fetch each id from the
-    # endpoint the folder was matched on, and refetch a cache entry that was
-    # stored for the other kind.
-    kind_by_id: dict = {}
-    for L in leaves:
-        if L.get("tmdb") and L.get("media") in ("movie", "tv"):
-            kind_by_id.setdefault(str(L["tmdb"]), L["media"])
+    # A movie and a TV show can share one numeric id, so metadata is cached and
+    # fetched per (id, kind); the kind is the one the folder was matched on.
+    def _leaf_kind(L):
+        return L.get("media") if L.get("media") in ("movie", "tv") else None
 
-    def _kind_mismatch(i) -> bool:
-        k = kind_by_id.get(str(i))
-        c = cache.get(i) or {}
-        return bool(k and c.get("kind") and c.get("kind") != k)
-
-    need = [i for i in ids if cache_needs_refetch(cache.get(i) or {}) or _kind_mismatch(i)]
+    ids = sorted({(str(L["tmdb"]), _leaf_kind(L)) for L in leaves if L.get("tmdb")}, key=lambda x: (x[0], x[1] or ""))
+    need = [(i, k) for i, k in ids if cache_needs_refetch(cache.get(ckey(i, k)) or {})]
     print(f"不重复的电影编号 = {len(ids)}，需要联网获取资料 = {len(need)}", flush=True)
     _done = [0]
     _done_lock = threading.Lock()
 
-    def _fetch_one(tid):
-        fetch_movie(tid, cache, force=_kind_mismatch(tid), kind=kind_by_id.get(str(tid)))
+    def _fetch_one(pair):
+        fetch_movie(pair[0], cache, kind=pair[1])
         with _done_lock:
             _done[0] += 1
             if _done[0] % 25 == 0:
@@ -4639,8 +4652,9 @@ def main():
     _pmap(_fetch_one, need)
     if need:
         save_json(CACHE_PATH, cache)
-    for tid in ids:
-        meta = cache.get(tid) or {}
+    for tid, kind in ids:
+        key = ckey(tid, kind)
+        meta = cache.get(key) or {}
         # Re-pick title with current language rules (cache may be stale)
         if meta.get("ok") and any(meta.get(k) for k in ("title_zh", "title_tw", "title_hk", "title_en")):
             fake_zh = {"title": meta.get("title_zh"), "release_date": meta.get("release_date")}
@@ -4658,9 +4672,9 @@ def main():
                 meta["picked_lang"] = lang
                 if year:
                     meta["year"] = year
-                cache[tid] = meta
+                cache[key] = meta
         if cache_needs_refetch(meta):
-            fetch_movie(tid, cache, kind=kind_by_id.get(str(tid)))
+            fetch_movie(tid, cache, kind=kind)
     save_json(CACHE_PATH, cache)
 
     # Multi-disc sibling folders (D1/D2…) sharing parent+tmdb → one folder
@@ -4671,7 +4685,7 @@ def main():
     used = {}
     for L in leaves:
         tid = L["tmdb"]
-        meta = cache.get(tid) or {}
+        meta = cache.get(ckey(tid, _leaf_kind(L))) or {}
         title = year = lang = source = None
         if meta.get("ok") and meta.get("picked_title"):
             title, year, lang = picked_title_from_cache(meta)
@@ -4906,27 +4920,27 @@ def main():
         targets = []
         seen = set()
 
-        def add_target(folder, tid):
+        def add_target(folder, tid, kind=None):
             if not folder or not tid:
                 return
             key = str(folder).lower()
             if key in seen:
                 return
             seen.add(key)
-            targets.append((str(folder), str(tid)))
+            targets.append((str(folder), str(tid), kind))
 
         if preview:
             for rec in plan:
-                add_target(rec["path"], rec.get("tmdb"))
+                add_target(rec["path"], rec.get("tmdb"), rec.get("media"))
             for s in skip:
                 if s.get("reason") == "already_ok":
-                    add_target(s.get("dest") or s.get("path"), s.get("tmdb"))
+                    add_target(s.get("dest") or s.get("path"), s.get("tmdb"), s.get("media"))
         else:
             for rec in ok:
-                add_target(rec.get("final") or rec.get("dest"), rec.get("tmdb"))
+                add_target(rec.get("final") or rec.get("dest"), rec.get("tmdb"), rec.get("media"))
             for s in skip:
                 if s.get("reason") == "already_ok":
-                    add_target(s.get("dest") or s.get("path"), s.get("tmdb"))
+                    add_target(s.get("dest") or s.get("path"), s.get("tmdb"), s.get("media"))
 
         if targets:
             print(f"{'预览' if preview else '处理'} 封面/NFO/网页，共 {len(targets)} 个文件夹...", flush=True)
