@@ -34,7 +34,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $notes = @"
+          $notes = @'
           Windows 可执行版。不需要安装 Python，也不需要旁边的 .py。
 
           这一版主要是防错配和剧集支持：
@@ -47,5 +47,5 @@ jobs:
           - 去掉中文发布站标签（【高清电影】、[国英双语]）、Extended.Cut、发布组后缀；`2046`、`1917` 这类数字片名能搜到
           - 近似年份容差收紧为 ±1 年
           - 图片下载失败会重试 4 次并计入失败
-          "@
+          '@
           gh release create "${{ inputs.tag }}" dist\TMDB-scrape-rename.exe --title "${{ inputs.tag }}" --notes "$notes" --target "${{ github.sha }}"
