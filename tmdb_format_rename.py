@@ -1450,6 +1450,16 @@ def extract_search_queries(name: str) -> list[str]:
     if cq and cq.lower() not in seen:
         out.insert(0, cq)
         seen.add(cq.lower())
+    # Titles that contain a number ("2046.2004", "Blade Runner 2049 (2017)"):
+    # everything before the release year, if it holds a lone number token.
+    _num_title = ""
+    _yms = list(YEAR_RE.finditer(raw))
+    if _yms:
+        _pre = re.sub(r"[._]+", " ", raw[: _yms[-1].start(1)])
+        _pre = re.sub(r"[\s\(\[【（\-]+$", "", _pre).strip()
+        if _pre and re.search(r"(?<!\d)\d{1,4}(?![\dpPiIkKxX])", _pre) and re.search(r"[A-Za-z\u4e00-\u9fff\d]", _pre):
+            _num_title = win_safe(_pre)
+
     # Glued title+resolution stubs only: ongbak1080p -> also try "ong bak"
     if re.search(r"(?i)[A-Za-z](?:360|480|720|1080|2160|4320)p", raw or ""):
         for base in list(out):
@@ -1578,6 +1588,16 @@ def extract_search_queries(name: str) -> list[str]:
             words = [w for w in q.split() if w]
             return len(words) <= 1
         out = [q for q in out if not _weak_one(q)] or multi
+
+    # The year-stripping above also strips years that are part of the title.
+    # Offer the full pre-year text as well: first when the title is only a
+    # number (2046, 1917), otherwise as a last resort (Blade Runner 2049).
+    if _num_title and re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", _num_title) or (_num_title and re.fullmatch(r"\d{1,4}", _num_title)):
+        if _num_title.lower() not in {x.lower() for x in out}:
+            if re.fullmatch(r"\d{1,4}", _num_title):
+                out.insert(0, _num_title)
+            else:
+                out.append(_num_title)
 
     return out[:8]
 
@@ -2686,7 +2706,9 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
             year_for_folder = year
             try:
                 cache = load_json(CACHE_PATH)
-                meta = fetch_movie(str(tid), cache, force=False)
+                _cent = search_cache.get(_search_cache_key(query, year, "", folder_media_hint(d.name) or "")) or {}
+                _mk = _cent.get("media") if _cent.get("media") in ("movie", "tv") else None
+                meta = fetch_movie(str(tid), cache, force=bool(_mk and cache.get(str(tid), {}).get("kind") not in (None, _mk)), kind=_mk)
                 save_json(CACHE_PATH, cache)
                 if isinstance(meta, dict) and meta.get("ok") and meta.get("picked_title"):
                     title_for_folder = meta.get("picked_title") or title_for_folder
@@ -3030,29 +3052,39 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
     # Search names: leaf itself, cleaned leaf, and parent folder (multi-disc D1/D2
     # often have short codes like TJ_GOLDEN_ERA_ANTHOLOGY_D1 while the parent has
     # the real title).
-    name_sources = [leaf.get("name") or ""]
     parent_name = Path(leaf.get("parent") or folder.parent).name
-    if parent_name and parent_name.lower() not in {"movies", "movie", "tv", "tvs", "电视剧", "电影", "动漫", "动画"}:
-        name_sources.append(parent_name)
-        if not year:
-            year = extract_year(parent_name)
     queries: list[str] = []
-    for src in name_sources:
-        queries.extend(extract_search_queries(src))
+    parent_queries: list[str] = []
+
+    def _add_queries(src: str, bucket: list) -> None:
+        bucket.extend(extract_search_queries(src))
         cq = clean_query_title(src)
         if cq:
-            queries.append(cq)
+            bucket.append(cq)
+
+    _add_queries(leaf.get("name") or "", queries)
     if meta.get("title"):
         queries.append(clean_query_title(str(meta.get("title"))))
     if meta.get("originaltitle"):
         queries.append(clean_query_title(str(meta.get("originaltitle"))))
+    # The parent folder is only a fallback for a leaf with no usable title of its
+    # own or a disc part (D1/CD2). Otherwise a library root such as "lib" or
+    # "Films" would be searched too and could outrank or hijack the real title.
+    parent_own = {q.strip().lower() for q in queries if q}
+    if parent_name and parent_name.lower() not in {"movies", "movie", "tv", "tvs", "电视剧", "电影", "动漫", "动画"}:
+        if not [q for q in queries if q and q.strip()] or looks_like_disc_folder(leaf.get("name") or ""):
+            _add_queries(parent_name, parent_queries)
+            if not year:
+                year = extract_year(parent_name)
+    parent_only = {q.strip().lower() for q in parent_queries if q} - parent_own
+    queries.extend(parent_queries)
     # Prefer sequel-bearing queries first; never lock onto a base-title hit when
     # the source has a sequel mark (强奸男2 / 聚会的目的2). Then prefer longer.
     src_mark = sequel_mark(leaf.get("name") or "") or sequel_mark(parent_name or "")
     def _q_rank(q: str):
         junk = 1 if re.search(r"\d{4}\s*[–—\-]\s*\d{4}", q) or re.search(r"\b(?:19|20)\d{2}\b", q) else 0
         has_seq = 0 if (src_mark and query_has_sequel(q, src_mark)) or sequel_mark(q) else 1
-        return (junk, has_seq, -len(q))
+        return (1 if q.strip().lower() in parent_only else 0, junk, has_seq, -len(q))
     # de-dupe
     seen_q = set()
     uniq = []
@@ -4230,10 +4262,23 @@ def main():
 
     cache = load_json(CACHE_PATH)
     ids = sorted({L["tmdb"] for L in leaves if L.get("tmdb")})
-    need = [i for i in ids if cache_needs_refetch(cache.get(i) or {})]
+    # A movie and a TV show can share one numeric id. Fetch each id from the
+    # endpoint the folder was matched on, and refetch a cache entry that was
+    # stored for the other kind.
+    kind_by_id: dict = {}
+    for L in leaves:
+        if L.get("tmdb") and L.get("media") in ("movie", "tv"):
+            kind_by_id.setdefault(str(L["tmdb"]), L["media"])
+
+    def _kind_mismatch(i) -> bool:
+        k = kind_by_id.get(str(i))
+        c = cache.get(i) or {}
+        return bool(k and c.get("kind") and c.get("kind") != k)
+
+    need = [i for i in ids if cache_needs_refetch(cache.get(i) or {}) or _kind_mismatch(i)]
     print(f"不重复的电影编号 = {len(ids)}，需要联网获取资料 = {len(need)}", flush=True)
     for n, tid in enumerate(need, 1):
-        fetch_movie(tid, cache)
+        fetch_movie(tid, cache, force=_kind_mismatch(tid), kind=kind_by_id.get(str(tid)))
         if n % 25 == 0:
             save_json(CACHE_PATH, cache)
             print(f"  fetched {n}/{len(need)}", flush=True)
@@ -4258,7 +4303,7 @@ def main():
                     meta["year"] = year
                 cache[tid] = meta
         if cache_needs_refetch(meta):
-            fetch_movie(tid, cache)
+            fetch_movie(tid, cache, kind=kind_by_id.get(str(tid)))
     save_json(CACHE_PATH, cache)
 
     # Multi-disc sibling folders (D1/D2…) sharing parent+tmdb → one folder
