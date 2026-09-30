@@ -3087,7 +3087,9 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
     queries.extend(parent_queries)
     # Prefer sequel-bearing queries first; never lock onto a base-title hit when
     # the source has a sequel mark (强奸男2 / 聚会的目的2). Then prefer longer.
-    src_mark = sequel_mark(leaf.get("name") or "") or sequel_mark(parent_name or "")
+    # The parent's trailing digit (a library root called "Movies2") is not a sequel
+    # mark of this leaf; only count it when the parent is what we are searching.
+    src_mark = sequel_mark(leaf.get("name") or "") or (sequel_mark(parent_name or "") if parent_queries else "")
     def _q_rank(q: str):
         junk = 1 if re.search(r"\d{4}\s*[–—\-]\s*\d{4}", q) or re.search(r"\b(?:19|20)\d{2}\b", q) else 0
         has_seq = 0 if (src_mark and query_has_sequel(q, src_mark)) or sequel_mark(q) else 1
