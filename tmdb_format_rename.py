@@ -1696,7 +1696,7 @@ def extract_search_queries(name: str) -> list[str]:
             else:
                 out.append(_num_title)
 
-    return out[:8]
+    return with_dot_variants(out)[:8]
 
 
 
@@ -1850,11 +1850,112 @@ def _norm_match_title(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     # Fantastic Four == Fantastic 4 (and similar Four/4 title spelling)
     s = re.sub(r"\bfour\b", "4", s)
-    return s
+    # WALLE == WALL-E == WALL·E: spacing and punctuation never tell titles apart
+    return s.replace(" ", "")
 
 
 
-def _search_cache_key(q: str, year, prefer_tid: str = "", prefer_kind: str = "") -> str:
+# Version / origin words in a folder name ("无耻之徒 美版", "Wallander (SE)", "维兰德（瑞典版）"):
+# (regex, origin countries, original languages). Used to pick between same-title candidates.
+_REGION_DEFS = [
+    (r"美版|美剧|美国版|(?i:American[\s._-]*(?:version|ver|remake))|(?<![A-Za-z0-9])US(?:A)?(?![A-Za-z0-9])", {"US"}, {"en"}),
+    (r"英版|英剧|英国版|(?i:British[\s._-]*(?:version|ver))|(?<![A-Za-z0-9])(?:UK|GB)(?![A-Za-z0-9])", {"GB"}, {"en"}),
+    (r"日版|日剧|日本版|(?i:Japanese[\s._-]*(?:version|ver|remake))|(?<![A-Za-z0-9])JP(?![A-Za-z0-9])", {"JP"}, {"ja"}),
+    (r"韩版|韩剧|韩国版|(?i:Korean[\s._-]*(?:version|ver|remake))|(?<![A-Za-z0-9])KR(?![A-Za-z0-9])", {"KR"}, {"ko"}),
+    (r"港版|港剧|香港版|(?<![A-Za-z0-9])HK(?![A-Za-z0-9])", {"HK"}, {"cn", "zh"}),
+    (r"台版|台剧|台湾版|(?<![A-Za-z0-9])TW(?![A-Za-z0-9])", {"TW"}, {"zh"}),
+    (r"国产版|国剧|大陆版|内地版", {"CN"}, {"zh", "cn"}),
+    (r"泰版|泰剧|泰国版|(?i:Thai[\s._-]*(?:version|ver))", {"TH"}, {"th"}),
+    (r"瑞典版|(?i:Swedish[\s._-]*(?:version|ver))|(?<![A-Za-z0-9])SE(?![A-Za-z0-9])", {"SE"}, {"sv"}),
+    (r"丹麦版|(?i:Danish[\s._-]*(?:version|ver))|(?<![A-Za-z0-9])DK(?![A-Za-z0-9])", {"DK"}, {"da"}),
+    (r"挪威版|(?i:Norwegian[\s._-]*(?:version|ver))", {"NO"}, {"no", "nb"}),
+    (r"芬兰版|(?i:Finnish[\s._-]*(?:version|ver))", {"FI"}, {"fi"}),
+    (r"荷兰版|(?i:Dutch[\s._-]*(?:version|ver))|(?<![A-Za-z0-9])NL(?![A-Za-z0-9])", {"NL"}, {"nl"}),
+    (r"德版|德国版|德剧|(?i:German[\s._-]*(?:version|ver))", {"DE"}, {"de"}),
+    (r"法版|法国版|法剧|(?i:French[\s._-]*(?:version|ver))", {"FR"}, {"fr"}),
+    (r"意大利版|意版|(?i:Italian[\s._-]*(?:version|ver))", {"IT"}, {"it"}),
+    (r"西班牙版|西版|(?i:Spanish[\s._-]*(?:version|ver))", {"ES"}, {"es"}),
+    (r"俄罗斯版|俄版|俄剧|(?i:Russian[\s._-]*(?:version|ver))", {"RU"}, {"ru"}),
+    (r"土耳其版|土剧|(?i:Turkish[\s._-]*(?:version|ver))", {"TR"}, {"tr"}),
+    (r"巴西版|(?i:Brazilian[\s._-]*(?:version|ver))", {"BR"}, {"pt"}),
+    (r"印度版|印剧|(?i:Indian[\s._-]*(?:version|ver))", {"IN"}, {"hi", "ta", "te", "ml", "bn", "mr", "kn"}),
+    (r"以色列版|(?i:Israeli[\s._-]*(?:version|ver))", {"IL"}, {"he"}),
+    (r"澳版|澳大利亚版|(?i:Australian[\s._-]*(?:version|ver))|(?<![A-Za-z0-9])AU(?![A-Za-z0-9])", {"AU"}, {"en"}),
+    (r"加拿大版|(?i:Canadian[\s._-]*(?:version|ver))", {"CA"}, {"en", "fr"}),
+]
+_REGION_RES = [(re.compile(pat), c, l) for pat, c, l in _REGION_DEFS]
+
+
+def region_hint(*names: str) -> dict | None:
+    """Origin implied by version words in the given names (folder name, first video names).
+
+    Returns {"countries": set, "langs": set, "key": "GB"} or None. Two different
+    origins in one name cancel out (nothing to decide on).
+    """
+    found = []
+    for pat, c, l in _REGION_RES:
+        if any(pat.search(n or "") for n in names):
+            found.append((pat, c, l))
+    if len(found) != 1:
+        return None
+    pat, c, l = found[0]
+    return {"countries": set(c), "langs": set(l), "key": "+".join(sorted(c)), "pat": pat}
+
+
+def strip_region_words(q: str, region: dict | None) -> str:
+    """'The Office US' -> 'The Office' (the version word is used as a filter instead)."""
+    if not region:
+        return q
+    return re.sub(r"\s+", " ", region["pat"].sub(" ", q or "")).strip(" ._-()[]（）")
+
+
+def with_dot_variants(queries: list) -> list:
+    """WALL E / WALL-E -> also WALL·E: TMDB does not find the middle-dot titles from those."""
+    out = list(queries)
+    for q0 in queries:
+        m0 = re.fullmatch(r"([A-Za-z]{2,})[ \-]([A-Za-z])", q0 or "")
+        if m0 and f"{m0.group(1)}·{m0.group(2)}" not in out:
+            out.append(f"{m0.group(1)}·{m0.group(2)}")
+    return out
+
+
+def _region_match(kind: str, r: dict, region: dict) -> bool:
+    oc = {str(x).upper() for x in (r.get("origin_country") or [])}
+    if kind == "tv" and oc:
+        return bool(oc & region["countries"])
+    return (r.get("original_language") or "").lower() in region["langs"] or bool(oc & region["countries"])
+
+
+def _cand_summary(cand_lists: list, q: str, limit: int = 6) -> list:
+    """The candidates a person would choose between: best title match first."""
+    rows = []
+    for kind, scored in cand_lists:
+        for item in scored[:12]:
+            r = item[2]
+            if isinstance(r, dict):
+                rows.append((_title_similarity(q, r), item[0], kind, str(item[1]), r))
+    rows.sort(key=lambda x: (-x[0], -x[1]))
+    out = []
+    for sim, _sc, kind, tid, r in rows[:limit]:
+        out.append({
+            "media": kind,
+            "tmdb": tid,
+            "title": r.get("title") or r.get("name") or "",
+            "original": r.get("original_title") or r.get("original_name") or "",
+            "year": str(r.get("release_date") or r.get("first_air_date") or "")[:4],
+            "country": "/".join(r.get("origin_country") or []),
+            "lang": r.get("original_language") or "",
+            "sim": round(sim, 2),
+        })
+    return out
+
+
+def describe_candidate(c: dict) -> str:
+    where = "·".join(x for x in (c.get("year"), c.get("country") or c.get("lang")) if x)
+    return f"{'电影' if c.get('media') == 'movie' else '剧集'}《{c.get('title') or c.get('original') or ''}》({where or '?'}) [tmdbid={c.get('tmdb')}]"
+
+
+def _search_cache_key(q: str, year, prefer_tid: str = "", prefer_kind: str = "", region_key: str = "") -> str:
     """Same key search_tmdb stores. Callers must use this to read the entry back."""
     mode = "auto" if media_is_auto() else ("tv" if media_is_tv() else "movie")
     prefer_tid = str(prefer_tid or "").strip()
@@ -1863,26 +1964,29 @@ def _search_cache_key(q: str, year, prefer_tid: str = "", prefer_kind: str = "")
     prefer_kind = str(prefer_kind or "").strip().lower()
     if prefer_kind not in ("movie", "tv"):
         prefer_kind = ""
-    return f"{q}|{year or ''}|{mode}|{prefer_tid}|{prefer_kind}|u4"
+    return f"{q}|{year or ''}|{mode}|{prefer_tid}|{prefer_kind}|{region_key or ''}|u5"
 
 
 # Set by main() from --accept-uncertain.
 ACCEPT_UNCERTAIN = False
 
 
-def _title_similarity(q: str, r: dict) -> float:
-    """1.0 for an exact (normalised) title match, else the best fuzzy ratio over the TMDB titles."""
+def _title_similarity(q: str, r: dict, region: dict | None = None) -> float:
+    """1.0 for an exact (normalised) title match, else the best fuzzy ratio over the TMDB titles.
+    With a region, a title's own version word ("维兰德（瑞典版）") does not count against it."""
     qn = _norm_match_title(q or "")
     if not qn or not isinstance(r, dict):
         return 0.0
     best = 0.0
     for k in ("title", "name", "original_title", "original_name"):
-        tn = _norm_match_title(r.get(k) or "")
-        if not tn:
-            continue
-        if tn == qn:
-            return 1.0
-        best = max(best, difflib.SequenceMatcher(None, qn, tn).ratio())
+        raw = r.get(k) or ""
+        for cand in ((raw, strip_region_words(raw, region)) if region else (raw,)):
+            tn = _norm_match_title(cand)
+            if not tn:
+                continue
+            if tn == qn:
+                return 1.0
+            best = max(best, difflib.SequenceMatcher(None, qn, tn).ratio())
     return best
 
 
@@ -1920,10 +2024,12 @@ def folder_title_components(name: str) -> list[str]:
     return comps
 
 
-def folder_title_mismatch_note(name: str, titles: list) -> str:
+def folder_title_mismatch_note(name: str, titles: list, region: dict | None = None) -> str:
     """"" when some part of the folder's title text matches a matched TMDB title; else why not."""
-    comps = folder_title_components(name)
+    comps = [c for c in (strip_region_words(c, region) for c in folder_title_components(name)) if c]
     titles = [t for t in (titles or []) if t]
+    if region:
+        titles = titles + [strip_region_words(t, region) for t in titles]
     if not comps or not titles:
         return ""
     best = 0.0
@@ -1941,7 +2047,7 @@ def folder_title_mismatch_note(name: str, titles: list) -> str:
     return f"文件夹名里的标题「{comps[0]}」与搜到的《{titles[0]}》不一致（{best:.0%}）"
 
 
-def _uncertain_note(q: str, year, chosen_tid, chosen_kind: str, cand_lists: list, prefer_kind: str = "") -> str:
+def _uncertain_note(q: str, year, chosen_tid, chosen_kind: str, cand_lists: list, prefer_kind: str = "", region: dict | None = None) -> str:
     """Why a match is a guess and must not be renamed unconfirmed; "" if it is not.
 
     cand_lists: [(kind, scored)] with scored = [(score, tid, result)].
@@ -1962,12 +2068,12 @@ def _uncertain_note(q: str, year, chosen_tid, chosen_kind: str, cand_lists: list
                 continue
             if tid == str(chosen_tid) and kind == chosen_kind:
                 chosen_r = r
-            elif _title_similarity(q, r) >= 1.0:
+            elif _title_similarity(q, r, region) >= 1.0:
                 yr = str(r.get("release_date") or r.get("first_air_date") or "")[:4]
                 others.append(f"{'电影' if kind == 'movie' else '剧集'}《{r.get('title') or r.get('name') or ''}》({yr or '?'}) [tmdbid={tid}]")
     sim = 1.0
     if chosen_r is not None:
-        sim = _title_similarity(q, chosen_r)
+        sim = _title_similarity(q, chosen_r, region)
         if sim < SIMILAR_ENOUGH:
             return f"搜到的标题《{chosen_r.get('title') or chosen_r.get('name') or ''}》与文件夹名不相似（{sim:.0%}），只是年份或个别词对上"
     if prefer_kind in ("movie", "tv") and chosen_kind in ("movie", "tv") and chosen_kind != prefer_kind:
@@ -2015,24 +2121,28 @@ def _merge_scored(dest: list, extra: list, penalty: int = 0) -> None:
         have.add(s[1])
 
 
-def search_tmdb(query: str, year: str | None, search_cache: dict, prefer_tid: str | None = None, prefer_kind: str | None = None):
+def search_tmdb(query: str, year: str | None, search_cache: dict, prefer_tid: str | None = None, prefer_kind: str | None = None, region: dict | None = None):
     """Return (tmdb_id, how). A search that hit API/network errors and found
     nothing is reported as "search_error" (and not cached), never "no_results".
+    The candidates considered are attached to the cache entry ("candidates").
     """
     fails0 = _search_fails()
-    tid, how = _search_tmdb_impl(query, year, search_cache, prefer_tid, prefer_kind)
+    _SEARCH_TLS.cands = None
+    tid, how = _search_tmdb_impl(query, year, search_cache, prefer_tid, prefer_kind, region)
+    pt = str(prefer_tid or "").strip()
+    pk = str(prefer_kind or "").strip().lower()
+    ckey_ = _search_cache_key((query or "").strip(), year, pt if pt.isdigit() else "", pk if pk in ("movie", "tv") else "", (region or {}).get("key", ""))
     if not tid and how == "no_results" and _search_fails() > fails0:
-        pt = str(prefer_tid or "").strip()
-        pk = str(prefer_kind or "").strip().lower()
-        search_cache.pop(
-            _search_cache_key((query or "").strip(), year, pt if pt.isdigit() else "", pk if pk in ("movie", "tv") else ""),
-            None,
-        )
+        search_cache.pop(ckey_, None)
         return None, "search_error"
+    rec = search_cache.get(ckey_)
+    cands = getattr(_SEARCH_TLS, "cands", None)
+    if isinstance(rec, dict) and cands and "candidates" not in rec:
+        rec["candidates"] = cands
     return tid, how
 
 
-def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_tid: str | None = None, prefer_kind: str | None = None):
+def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_tid: str | None = None, prefer_kind: str | None = None, region: dict | None = None):
     """Return (tmdb_id, how).
 
     Auto mode cascade when title collides:
@@ -2051,7 +2161,7 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
     prefer_kind = str(prefer_kind or "").strip().lower()
     if prefer_kind not in ("movie", "tv"):
         prefer_kind = ""
-    key = _search_cache_key(q, year, prefer_tid, prefer_kind)
+    key = _search_cache_key(q, year, prefer_tid, prefer_kind, (region or {}).get("key", ""))
     has_year = bool(year and re.fullmatch(r"\d{4}", str(year)))
     cached = search_cache.get(key) if isinstance(search_cache.get(key), dict) else None
     if cached:
@@ -2191,6 +2301,13 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
                 pass
         movie_scored.sort(key=lambda x: -x[0])
         tv_scored.sort(key=lambda x: -x[0])
+        if region:
+            # "美版" / "（瑞典版）": keep the candidates made in that place, if any are.
+            m_keep = [x for x in movie_scored if _region_match("movie", x[2], region)]
+            t_keep = [x for x in tv_scored if _region_match("tv", x[2], region)]
+            if m_keep or t_keep:
+                movie_scored, tv_scored = m_keep, t_keep
+        _SEARCH_TLS.cands = _cand_summary([("movie", movie_scored), ("tv", tv_scored)], q)
 
         movie_has = bool(movie_scored)
         tv_has = bool(tv_scored)
@@ -2210,6 +2327,7 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
                     # A folder hint (S01, 电视剧, ...) settles the side: only rivals on it count.
                     [(k, sc) for k, sc in (("movie", movie_scored), ("tv", tv_scored)) if prefer_kind not in ("movie", "tv") or k == prefer_kind],
                     prefer_kind,
+                    region,
                 ),
             }
             return str(tid), how if str(how).startswith("search") else "search"
@@ -2363,6 +2481,10 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
 
     kind = "tv" if media_is_tv() else "movie"
     scored = _search_tmdb_one_kind(kind, q, year)
+    if region:
+        keep = [x for x in scored if _region_match(kind, x[2], region)]
+        scored = keep or scored
+    _SEARCH_TLS.cands = _cand_summary([(kind, scored)], q)
     tid, how, scored2 = _pick_unique(scored)
     if how == "ambiguous_no_year":
         search_cache[key] = {"ok": False, "error": "ambiguous_no_year", "query": q, "year": year}
@@ -2375,7 +2497,7 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
         "unique": (has_year or len(scored) == 1 or bool(prefer_tid)),
         "query": q, "year": year,
         "titles": _chosen_titles(tid, kind, [(kind, scored)]),
-        "uncertain": _uncertain_note(q, year, tid, kind, [(kind, scored)], prefer_kind),
+        "uncertain": _uncertain_note(q, year, tid, kind, [(kind, scored)], prefer_kind, region),
     }
     return tid, how if how.startswith("search") else "search"
 
@@ -3191,6 +3313,59 @@ def _try_unique_title_search(leaf: dict, search_cache: dict) -> bool:
     return False
 
 
+# Choices made in the GUI for folders the tool could not decide: {path: {"tmdb", "media"}}.
+USER_CHOICES: dict = {}
+
+
+def _path_key(path) -> str:
+    return str(path).replace("/", "\\").rstrip("\\").lower()
+
+
+def load_user_choices() -> dict:
+    """Drop choices whose folder no longer exists (it was renamed after the choice was used)."""
+    data = load_json(TOOLS / "tmdb_user_choices.json")
+    out = {}
+    for k, v in (data or {}).items():
+        if isinstance(v, dict) and str(v.get("tmdb") or "").isdigit() and v.get("media") in ("movie", "tv"):
+            out[k] = v
+    return out
+
+
+def _leaf_video_stems(folder: Path, limit: int = 40) -> list[str]:
+    """Stems of the videos in a folder and in its Season subfolders."""
+    vids = []
+    try:
+        vids = list(list_videos_in_dir(folder))
+        for sub in interesting_subdirs(folder)[:8]:
+            vids += list_videos_in_dir(sub)
+    except Exception:
+        pass
+    return [v.stem for v in vids[:limit]]
+
+
+def year_from_stems(stems: list) -> str | None:
+    """The release year the video file names agree on (None if none, or they disagree)."""
+    years = []
+    for st in stems:
+        y = extract_year(strip_season_tokens(st))
+        if y:
+            years.append(y)
+    if not years:
+        return None
+    top = Counter(years).most_common()
+    return top[0][0] if len(top) == 1 or top[0][1] > top[1][1] else None
+
+
+def _cand_region_ok(c: dict, region: dict) -> bool:
+    if c.get("country"):
+        return bool({x.upper() for x in c["country"].split("/")} & region["countries"])
+    return (c.get("lang") or "").lower() in region["langs"]
+
+
+def candidates_note(cands: list, limit: int = 4) -> str:
+    return "候选：" + "；".join(describe_candidate(c) for c in (cands or [])[:limit]) if cands else ""
+
+
 def _cjk_qualifier(name: str) -> tuple[str, str]:
     """'维兰德（瑞典版）.Wallander…' -> ('维兰德', '瑞典版'): a version tag after a Chinese title."""
     n = strip_season_tokens(strip_site_tags(name or ""))
@@ -3215,6 +3390,12 @@ def _leaf_media_hint(leaf: dict) -> str | None:
 
 def resolve_leaf_id(leaf: dict, search_cache: dict):
     """Fill tmdb id via nfo or search. Mutates leaf."""
+    choice = USER_CHOICES.get(_path_key(leaf.get("path") or ""))
+    if choice:
+        leaf["tmdb"] = str(choice["tmdb"])
+        leaf["media"] = choice["media"]
+        leaf["id_from"] = "user_choice"
+        return True
     if leaf.get("tmdb"):
         tid0 = str(leaf.get("tmdb") or "").strip()
         if media_is_auto():
@@ -3318,6 +3499,13 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
         y = str(meta.get("year"))[:4]
         if y.isdigit():
             year = y
+    stems = _leaf_video_stems(folder)
+    if not year:
+        year = year_from_stems(stems)
+        if year:
+            leaf["year_from"] = "files"
+    region = region_hint(leaf.get("name") or "", *stems[:3])
+    region_key = (region or {}).get("key", "")
     # Search names: leaf itself, cleaned leaf, and parent folder (multi-disc D1/D2
     # often have short codes like TJ_GOLDEN_ERA_ANTHOLOGY_D1 while the parent has
     # the real title).
@@ -3373,9 +3561,12 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
             continue
         seen_q.add(q.lower())
         uniq.append(q)
-    queries = uniq
+    if region:
+        uniq = [q for q in dict.fromkeys(strip_region_words(q, region) for q in uniq) if q]
+    queries = with_dot_variants(uniq)
     last_how = "empty_query"
     last_query = ""
+    last_cent = None
     saw_search_error = False
     # An uncertain or ambiguous answer to one query must not stop the others: a
     # cleaner query may still give a certain hit. Keep the first such answer and
@@ -3387,20 +3578,23 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
             continue
         _prefer_tid = str(leaf.get("prefer_tmdb") or leaf.get("tmdb") or "") or None
         _prefer_kind = _leaf_media_hint(leaf)
-        tid, how = search_tmdb(query, year, search_cache, prefer_tid=_prefer_tid, prefer_kind=_prefer_kind)
+        tid, how = search_tmdb(query, year, search_cache, prefer_tid=_prefer_tid, prefer_kind=_prefer_kind, region=region)
         last_how, last_query = how, query
+        last_cent = search_cache.get(_search_cache_key(query, year, _prefer_tid or "", _prefer_kind or "", region_key))
         if how == "search_error":
             saw_search_error = True
         if tid:
-            cent = search_cache.get(
-                _search_cache_key(query, year, _prefer_tid or "", _prefer_kind or "")
-            )
+            cent = last_cent
             note = (cent or {}).get("uncertain") if isinstance(cent, dict) else ""
-            if not note and qual and _norm_match_title(qual) not in _norm_match_title(query):
+            if not note and region and isinstance(cent, dict):
+                chosen_c = next((c for c in cent.get("candidates") or [] if str(c.get("tmdb")) == str(tid)), None)
+                if chosen_c is not None and not _cand_region_ok(chosen_c, region):
+                    note = f"文件夹名标了「{'/'.join(sorted(region['countries']))}」版，但匹配到的是 {chosen_c.get('country') or chosen_c.get('lang') or '?'} 制作"
+            if not note and qual and not region and _norm_match_title(qual) not in _norm_match_title(query):
                 note = f"文件夹名里的「{qual}」没有出现在搜索词里，可能是另一个版本"
             if not note and isinstance(cent, dict) and not (_prefer_tid and str(_prefer_tid) == str(tid)):
                 # The query builder may have dropped a word of the real title (It Boy -> Boy).
-                note = folder_title_mismatch_note(leaf.get("name") or "", cent.get("titles") or [])
+                note = folder_title_mismatch_note(leaf.get("name") or "", cent.get("titles") or [], region)
             if note:
                 if not ACCEPT_UNCERTAIN:
                     # A guess: report it, do not rename unless confirmed.
@@ -3408,9 +3602,10 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                         pending = {
                             "id_from": "uncertain_title_only",
                             "reason": "uncertain_title_only",
-                            "note": f"{note} | 候选: {(cent or {}).get('media') or ''} [tmdbid={tid}]",
+                            "note": f"{note} | {candidates_note((cent or {}).get('candidates'))}",
                             "search_query": query,
                             "candidate_tmdb": str(tid),
+                            "candidates": (cent or {}).get("candidates") or [],
                             "uncertain": note,
                         }
                     continue
@@ -3436,9 +3631,7 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
             leaf["media"] = media_hit
             return True
         if how == "ambiguous_movie_and_tv":
-            cent = search_cache.get(
-                _search_cache_key(query, year, _prefer_tid or "", _prefer_kind or "")
-            ) or {}
+            cent = last_cent or {}
             if pending is None or pending.get("reason") != "uncertain_title_only":
                 pending = {
                     "ambiguous": True,
@@ -3447,10 +3640,11 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                     "search_query": query,
                     "movie_tmdb": cent.get("movie_tmdb"),
                     "tv_tmdb": cent.get("tv_tmdb"),
-                    "note": "电影候选=%s %s / 剧集候选=%s %s" % (
+                    "candidates": cent.get("candidates") or [],
+                    "note": ("电影候选=%s %s / 剧集候选=%s %s" % (
                         cent.get("movie_tmdb"), cent.get("movie_title") or "",
                         cent.get("tv_tmdb"), cent.get("tv_title") or "",
-                    ),
+                    )) + (" | " + candidates_note(cent.get("candidates")) if cent.get("candidates") else ""),
                 }
     if pending is not None:
         leaf.update(pending)
@@ -3460,6 +3654,10 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
     leaf["id_from"] = "search_error" if saw_search_error else (last_how or "unresolved")
     leaf["search_query"] = last_query or (queries[0] if queries else "")
     leaf["search_year"] = year
+    lc = last_cent if isinstance(last_cent, dict) else {}
+    if lc.get("candidates"):
+        leaf["candidates"] = lc["candidates"]
+        leaf["note"] = candidates_note(lc["candidates"])
     return False
 
 
@@ -4576,6 +4774,8 @@ def main():
         print(f"  跳过已刮削（名字已含 [tmdbid=]）: {len(skipped_done)}", flush=True)
 
     search_cache = load_json(SEARCH_CACHE_PATH)
+    USER_CHOICES.clear()
+    USER_CHOICES.update(load_user_choices())
     leaves = list(tagged)
     unresolved = []
     if media_is_auto() and tagged:
