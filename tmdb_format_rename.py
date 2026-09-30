@@ -1650,7 +1650,14 @@ def is_finished_scrape(leaf: dict) -> bool:
     """A previous run already renamed this folder to include [tmdbid=N]."""
     if (leaf or {}).get("id_from") != "bracket_tmdbid":
         return False
-    return str((leaf or {}).get("tmdb") or "").strip().isdigit()
+    if not str((leaf or {}).get("tmdb") or "").strip().isdigit():
+        return False
+    # Named but no poster yet (the artwork download failed last time, or the
+    # folder was renamed by hand): not finished, so it is checked again.
+    try:
+        return (Path(leaf.get("path") or "") / "poster.jpg").is_file()
+    except Exception:
+        return True
 
 
 def extract_id_from_name(name: str):
@@ -3167,27 +3174,33 @@ def _download_bytes(url: str, dest: Path, min_size: int = 500) -> str:
     if _file_ok(dest, min_size=1):
         return "already_exists"
     tmp = dest.with_suffix(dest.suffix + ".part")
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA, "Connection": "keep-alive"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            data = r.read()
-        if not data or len(data) < min_size:
-            return "too_small"
-        tmp.write_bytes(data)
-        if dest.exists():
+    last_err = ""
+    for attempt in range(1, 4):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA, "Connection": "keep-alive"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = r.read()
+            if not data or len(data) < min_size:
+                return "too_small"
+            tmp.write_bytes(data)
+            if dest.exists():
+                try:
+                    dest.unlink()
+                except Exception:
+                    pass
+            tmp.replace(dest)
+            return "ok"
+        except Exception as e:
+            last_err = str(e)
             try:
-                dest.unlink()
+                if tmp.exists():
+                    tmp.unlink()
             except Exception:
                 pass
-        tmp.replace(dest)
-        return "ok"
-    except Exception as e:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
-        return f"err:{e}"
+            if isinstance(e, urllib.error.HTTPError) and e.code in (400, 403, 404):
+                break  # definitive: this file is not there
+            time.sleep(1.5 * attempt)
+    return f"err:{last_err}"
 
 
 def download_artwork(folder: Path, meta: dict, preview: bool = False) -> dict:
@@ -3687,7 +3700,16 @@ def apply_artwork_and_nfo(
             else:
                 any_ok = any(v == "ok" for v in results.values())
                 any_exist = any(v == "already_exists" for v in results.values())
-                if any_ok:
+                if any(str(v).startswith("err") for v in results.values()):
+                    # A poster/fanart/logo that failed to download must not hide
+                    # behind another file that succeeded.
+                    art_stats["fail"] += 1
+                    print(
+                        f"  图片下载失败: {folder.name} | "
+                        + ";".join(f"{k}={v}" for k, v in results.items() if str(v).startswith("err")),
+                        flush=True,
+                    )
+                elif any_ok:
                     art_stats["ok"] += 1
                 elif any_exist and not any(str(v).startswith("err") for v in results.values()):
                     art_stats["skip"] += 1
