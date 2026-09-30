@@ -52,7 +52,8 @@ def find_python_for_script() -> str:
 def engine_importable() -> bool:
     """True if tmdb_format_rename can be imported (sibling .py or frozen bundle)."""
     try:
-        import tmdb_format_rename  # noqa: F401
+        import importlib
+        importlib.import_module("tmdb_format_rename")
         return True
     except Exception:
         return False
@@ -660,7 +661,7 @@ class App(tk.Tk):
         wrap_count = int(data.get("wrapped_count") or len(wrapped))
         skip_count = int(data.get("skip_count") or len(skip))
         ok_count = len(ok_list)
-        fail_count = 0  # filled after problem rows built
+        
 
         mode = "仅预览" if preview else "正式刮削"
         tip = ""
@@ -690,7 +691,7 @@ class App(tk.Tk):
             "",
             "分类说明：",
             f"  · 电影识别 / 剧集识别（{leaf_count}）：已拿到 TMDB 编号",
-            f"  · 未能匹配：搜不到 / 电影剧集都命中(重复) / 刮削或改名失败等，原因见列表说明列",
+            "  · 未能匹配：搜不到 / 电影剧集都命中(重复) / 不确定 / 刮削或改名失败等，原因见列表说明列",
             f"  · 更改（含散落整理 {wrap_count}）：文件夹改名 + 散落建夹改标题；待改 {plan_count}，已改 {ok_count}",
             f"  · 跳过已刮削：{int(data.get('skipped_done_count') or 0)}（名字里已有 [tmdbid=]，本次不联网、不改文件）",
             "",
@@ -862,7 +863,6 @@ class App(tk.Tk):
 
         self._fill_tree("unmatched", um_rows)
         self._set_tab_title("unmatched", "未能匹配", len(um_rows))
-        fail_count = len(um_rows)
 
         self.summary.configure(
             text=(

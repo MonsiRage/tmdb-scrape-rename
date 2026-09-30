@@ -25,15 +25,16 @@ from __future__ import annotations
 import json
 import os
 import re
-import unicodedata
 import shutil
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.sax.saxutils
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -526,26 +527,46 @@ def xml_escape(s: str) -> str:
 
 # One run asks for the same search/detail URL many times (classify, then
 # score, then the next folder with the same title). Cache the body.
-# TMDB's published ceiling is about 40 requests / 10s; stay under it and
-# wait out HTTP 429 instead of recording the movie as a failure.
+# Stay under TMDB's rate limit and wait out HTTP 429 instead of recording the
+# movie as a failure.
 _URL_CACHE: dict[str, dict] = {}
 _REQ_TIMES: list[float] = []
 
 
+_PACE_LOCK = threading.Lock()
+
+
 def _pace_requests() -> None:
-    window = 10.0
-    limit = 35
-    now = time.monotonic()
-    while _REQ_TIMES and now - _REQ_TIMES[0] >= window:
-        _REQ_TIMES.pop(0)
-    if len(_REQ_TIMES) >= limit:
-        wait = window - (now - _REQ_TIMES[0]) + 0.05
-        if wait > 0:
-            time.sleep(wait)
-        now = time.monotonic()
-        while _REQ_TIMES and now - _REQ_TIMES[0] >= window:
-            _REQ_TIMES.pop(0)
-    _REQ_TIMES.append(time.monotonic())
+    """Sliding window, safe to call from several threads.
+
+    TMDB allows roughly 50 requests/s; stay at 30/s. HTTP 429 is still waited out
+    in api_get.
+    """
+    window = 1.0
+    limit = 30
+    while True:
+        with _PACE_LOCK:
+            now = time.monotonic()
+            while _REQ_TIMES and now - _REQ_TIMES[0] >= window:
+                _REQ_TIMES.pop(0)
+            if len(_REQ_TIMES) < limit:
+                _REQ_TIMES.append(now)
+                return
+            wait = window - (now - _REQ_TIMES[0]) + 0.01
+        time.sleep(max(wait, 0.01))
+
+
+# Worker threads for network-bound steps (search, detail fetch, artwork).
+WORKERS = max(1, int(os.environ.get("TMDB_WORKERS") or 8))
+
+
+def _pmap(fn, items):
+    """fn over items on WORKERS threads, results in input order."""
+    items = list(items)
+    if WORKERS <= 1 or len(items) <= 1:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(max_workers=min(WORKERS, len(items))) as ex:
+        return list(ex.map(fn, items))
 
 
 def api_get(url: str, retries: int = 4):
@@ -743,6 +764,11 @@ def fetch_movie_images(tid: str, kind: str | None = None) -> dict:
         f"https://api.themoviedb.org/3/{('tv' if (str(kind or '').lower()=='tv' or (str(kind or '').lower() not in ('movie','tv') and media_is_tv())) else 'movie')}/{tid}/images?api_key={API_KEY}"
         f"&include_image_language=zh,zh-CN,zh-TW,zh-HK,en,null"
     )
+    return _images_from_payload(data)
+
+
+def _images_from_payload(data) -> dict:
+    """Best poster / backdrop / logo from an /images payload (or its appended copy)."""
     if not isinstance(data, dict) or data.get("_error"):
         return {"poster_path": "", "backdrop_path": "", "logo_path": ""}
     poster = _pick_best_image(data.get("posters") or [])
@@ -794,10 +820,10 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
         else:
             kind = "tv" if media_is_tv() else "movie"
     append = (
-        "&append_to_response=credits,external_ids,content_ratings,videos"
+        "&append_to_response=credits,external_ids,content_ratings,videos,images"
         if kind == "tv"
-        else "&append_to_response=credits,release_dates,videos,external_ids"
-    )
+        else "&append_to_response=credits,release_dates,videos,external_ids,images"
+    ) + "&include_image_language=zh,zh-CN,zh-TW,zh-HK,en,null"
     zh = api_get(
         f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}"
         f"&language=zh-CN{append}"
@@ -859,7 +885,9 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
             if not backdrop and d.get("backdrop_path"):
                 backdrop = d.get("backdrop_path") or ""
 
-    imgs = fetch_movie_images(tid, kind)
+    # images normally ride along in the detail call (append_to_response)
+    appended = base.get("images") if isinstance(base, dict) else None
+    imgs = _images_from_payload(appended) if isinstance(appended, dict) else fetch_movie_images(tid, kind)
     if imgs.get("poster_path"):
         poster = imgs["poster_path"]
     if imgs.get("backdrop_path"):
@@ -1681,7 +1709,11 @@ def extract_id_from_name(name: str):
 
 # Bumped whenever a TMDB search request ends in an API/network error, so a
 # failed lookup can be told apart from a genuine "no results".
-_SEARCH_FAILS = [0]
+_SEARCH_TLS = threading.local()
+
+
+def _search_fails() -> int:
+    return getattr(_SEARCH_TLS, "n", 0)
 
 
 def _search_tmdb_one_kind(kind: str, q: str, year: str | None):
@@ -1707,7 +1739,7 @@ def _search_tmdb_one_kind(kind: str, q: str, year: str | None):
             params.pop("first_air_date_year", None)
             data = api_get(f"https://api.themoviedb.org/3/search/{kind}?" + urllib.parse.urlencode(params))
     if not isinstance(data, dict) or data.get("_error"):
-        _SEARCH_FAILS[0] += 1
+        _SEARCH_TLS.n = _search_fails() + 1
         return []
     results = data.get("results") or []
     scored = []
@@ -1831,9 +1863,9 @@ def search_tmdb(query: str, year: str | None, search_cache: dict, prefer_tid: st
     """Return (tmdb_id, how). A search that hit API/network errors and found
     nothing is reported as "search_error" (and not cached), never "no_results".
     """
-    fails0 = _SEARCH_FAILS[0]
+    fails0 = _search_fails()
     tid, how = _search_tmdb_impl(query, year, search_cache, prefer_tid, prefer_kind)
-    if not tid and how == "no_results" and _SEARCH_FAILS[0] > fails0:
+    if not tid and how == "no_results" and _search_fails() > fails0:
         pt = str(prefer_tid or "").strip()
         pk = str(prefer_kind or "").strip().lower()
         search_cache.pop(
@@ -1863,7 +1895,6 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
     prefer_kind = str(prefer_kind or "").strip().lower()
     if prefer_kind not in ("movie", "tv"):
         prefer_kind = ""
-    mode = "auto" if media_is_auto() else ("tv" if media_is_tv() else "movie")
     key = _search_cache_key(q, year, prefer_tid, prefer_kind)
     has_year = bool(year and re.fullmatch(r"\d{4}", str(year)))
     cached = search_cache.get(key) if isinstance(search_cache.get(key), dict) else None
@@ -1907,6 +1938,30 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
             return near[0]
         return None
 
+    def _from_year_hits(yh: list):
+        """Several or one candidate(s) in the folder's year: (tid, how, use)."""
+        if len(yh) == 1:
+            return yh[0][1], "search_year", yh
+        if prefer_tid:
+            hit = [s for s in yh if str(s[1]) == prefer_tid]
+            if len(hit) == 1:
+                return hit[0][1], "search_tmdbid", hit
+        # Exact title among year hits (NOT TMDB vote scores).
+        qn = _norm_match_title(q or "")
+        exact = []
+        for s in yh:
+            r0 = s[2] if isinstance(s[2], dict) else {}
+            for k in ("title", "name", "original_title", "original_name"):
+                t = _norm_match_title(r0.get(k) or "")
+                if t and t == qn:
+                    exact.append(s)
+                    break
+        if exact and len({str(s[1]) for s in exact}) == 1:
+            return exact[0][1], "search_year_exact", exact
+        # Prefer abstain over wrong match: score gaps are NOT unique enough
+        # (The Nun / Ringu / Lamb same-year collisions). Unmatched tab is OK.
+        return None, "ambiguous_no_year", (exact if len(exact) > 1 else yh)
+
     def _pick_unique(scored: list):
         """Return (tid, how, scored) after title→year→tmdbid cascade within one side."""
         if not scored:
@@ -1916,32 +1971,8 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
             # still apply year if present and top doesn't match year — escalate
             if has_year:
                 yh = _filter_year(scored)
-                if len(yh) == 1:
-                    return yh[0][1], "search_year", yh
-                if len(yh) > 1:
-                    if prefer_tid:
-                        hit = [s for s in yh if str(s[1]) == prefer_tid]
-                        if len(hit) == 1:
-                            return hit[0][1], "search_tmdbid", hit
-                    # Exact title among year hits (NOT TMDB vote scores).
-                    qn = _norm_match_title(q or "")
-                    exact = []
-                    for s in yh:
-                        r0 = s[2] if isinstance(s[2], dict) else {}
-                        for k in ("title", "name", "original_title", "original_name"):
-                            t = _norm_match_title(r0.get(k) or "")
-                            if t and t == qn:
-                                exact.append(s)
-                                break
-                    if len(exact) == 1:
-                        return exact[0][1], "search_year_exact", exact
-                    if len({str(s[1]) for s in exact}) == 1 and exact:
-                        return exact[0][1], "search_year_exact", exact
-                    # Prefer abstain over wrong match: score gaps are NOT unique enough
-                    # (The Nun / Ringu / Lamb same-year collisions). Unmatched tab is OK.
-                    if len(exact) > 1:
-                        return None, "ambiguous_no_year", exact
-                    return None, "ambiguous_no_year", yh
+                if yh:
+                    return _from_year_hits(yh)
                 # top title unique but wrong year → try year filter empty → no year match
                 if yh == [] and _year_of(scored[0][2]) and _year_of(scored[0][2]) != str(year):
                     hit = _off_by_one_exact(scored)
@@ -1952,30 +1983,8 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
         # title collision within side → escalate year
         if has_year:
             yh = _filter_year(scored)
-            if len(yh) == 1:
-                return yh[0][1], "search_year", yh
-            if len(yh) > 1:
-                if prefer_tid:
-                    hit = [s for s in yh if str(s[1]) == prefer_tid]
-                    if len(hit) == 1:
-                        return hit[0][1], "search_tmdbid", hit
-                qn = _norm_match_title(q or "")
-                exact = []
-                for s in yh:
-                    r0 = s[2] if isinstance(s[2], dict) else {}
-                    for k in ("title", "name", "original_title", "original_name"):
-                        t = _norm_match_title(r0.get(k) or "")
-                        if t and t == qn:
-                            exact.append(s)
-                            break
-                if len(exact) == 1:
-                    return exact[0][1], "search_year_exact", exact
-                if len({str(s[1]) for s in exact}) == 1 and exact:
-                    return exact[0][1], "search_year_exact", exact
-                # Prefer abstain over wrong match (no popularity/score tie-break)
-                if len(exact) > 1:
-                    return None, "ambiguous_no_year", exact
-                return None, "ambiguous_no_year", yh
+            if yh:
+                return _from_year_hits(yh)
             hit = _off_by_one_exact(scored)
             if hit:
                 return hit[1], "search_year", [hit]
@@ -2136,7 +2145,7 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
             def _exact_side(side):
                 out = []
                 for item in side:
-                    sc, tid0, r0 = item[0], item[1], item[2]
+                    r0 = item[2]
                     for k in ("title", "name", "original_title", "original_name"):
                         if qn and _norm_match_title(r0.get(k) or "") == qn:
                             out.append(item)
@@ -3122,6 +3131,7 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
     # The parent folder is only a fallback for a leaf with no usable title of its
     # own or a disc part (D1/CD2). Otherwise a library root such as "lib" or
     # "Films" would be searched too and could outrank or hijack the real title.
+    has_own_queries = any(q and q.strip() for q in queries)
     parent_own = {q.strip().lower() for q in queries if q}
     if parent_name and parent_name.lower() not in {"movies", "movie", "tv", "tvs", "电视剧", "电影", "动漫", "动画"}:
         if not [q for q in queries if q and q.strip()] or looks_like_disc_folder(leaf.get("name") or ""):
@@ -3134,7 +3144,7 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
     # the source has a sequel mark (强奸男2 / 聚会的目的2). Then prefer longer.
     # The parent's trailing digit (a library root called "Movies2") is not a sequel
     # mark of this leaf; only count it when the parent is what we are searching.
-    src_mark = sequel_mark(leaf.get("name") or "") or (sequel_mark(parent_name or "") if parent_queries else "")
+    src_mark = sequel_mark(leaf.get("name") or "") or (sequel_mark(parent_name or "") if parent_queries and not has_own_queries else "")
     def _q_rank(q: str):
         junk = 1 if re.search(r"\d{4}\s*[–—\-]\s*\d{4}", q) or re.search(r"\b(?:19|20)\d{2}\b", q) else 0
         has_seq = 0 if (src_mark and query_has_sequel(q, src_mark)) or sequel_mark(q) else 1
@@ -3726,6 +3736,18 @@ def apply_artwork_and_nfo(
     samples = []
     write_nfo_now = do_nfo and (not preview or preview_nfo)
 
+    # Downloads are the slow part of a real run: fetch them on worker threads
+    # first, then let the loop below report what happened.
+    art_prefetched: dict = {}
+    if do_poster and not preview:
+        def _dl(pair):
+            folder_s, tid = pair
+            meta0 = cache.get(str(tid)) or {}
+            if meta0.get("picked_title") and meta0.get("poster_path"):
+                return folder_s, download_artwork(Path(folder_s), meta0, preview=False)
+            return folder_s, None
+        art_prefetched = {k: v for k, v in _pmap(_dl, folders_and_ids) if v is not None}
+
     for folder_s, tid in folders_and_ids:
         folder = Path(folder_s)
         meta = cache.get(str(tid)) or {}
@@ -3750,7 +3772,7 @@ def apply_artwork_and_nfo(
         nfo_st = ""
 
         if do_poster:
-            results = download_artwork(folder, meta, preview=preview)
+            results = art_prefetched.get(folder_s) or download_artwork(folder, meta, preview=preview)
             # Count poster primarily for stats (keep similar to old behavior)
             pst = results.get("poster", "")
             if preview:
@@ -4157,7 +4179,11 @@ def stamp_item_media(item: dict) -> dict:
     tid = str(item.get("tmdb") or "").strip()
     name = item.get("name") or item.get("path") or ""
     kind = ""
-    if tid.isdigit():
+    prev = (item.get("media") or "").strip().lower()
+    if prev in ("movie", "tv") and tid.isdigit():
+        # Already decided while matching; do not spend two more requests on it.
+        kind = prev
+    elif tid.isdigit():
         try:
             kind = classify_tmdb_id_kind(tid, name)
         except Exception:
@@ -4307,8 +4333,9 @@ def main():
     search_cache = load_json(SEARCH_CACHE_PATH)
     leaves = list(tagged)
     unresolved = []
-    for u in untagged:
-        if resolve_leaf_id(u, search_cache):
+    resolved = _pmap(lambda u: resolve_leaf_id(u, search_cache), untagged)
+    for u, ok in zip(untagged, resolved):
+        if ok:
             leaves.append(u)
         else:
             if not u.get("reason"):
@@ -4365,11 +4392,19 @@ def main():
 
     need = [i for i in ids if cache_needs_refetch(cache.get(i) or {}) or _kind_mismatch(i)]
     print(f"不重复的电影编号 = {len(ids)}，需要联网获取资料 = {len(need)}", flush=True)
-    for n, tid in enumerate(need, 1):
+    _done = [0]
+    _done_lock = threading.Lock()
+
+    def _fetch_one(tid):
         fetch_movie(tid, cache, force=_kind_mismatch(tid), kind=kind_by_id.get(str(tid)))
-        if n % 25 == 0:
-            save_json(CACHE_PATH, cache)
-            print(f"  fetched {n}/{len(need)}", flush=True)
+        with _done_lock:
+            _done[0] += 1
+            if _done[0] % 25 == 0:
+                print(f"  fetched {_done[0]}/{len(need)}", flush=True)
+
+    _pmap(_fetch_one, need)
+    if need:
+        save_json(CACHE_PATH, cache)
     for tid in ids:
         meta = cache.get(tid) or {}
         # Re-pick title with current language rules (cache may be stale)
