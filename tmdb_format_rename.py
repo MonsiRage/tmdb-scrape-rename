@@ -590,7 +590,7 @@ def api_get(url: str, retries: int = 4):
             attempt += 1
             if attempt >= retries:
                 return {"_error": str(e)}
-            time.sleep(0.6 * attempt)
+            time.sleep(1.5 * attempt)
     return {"_error": "unknown"}
 
 
@@ -3106,6 +3106,7 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
     queries = uniq
     last_how = "empty_query"
     last_query = ""
+    saw_search_error = False
     for query in queries:
         # If source is clearly a sequel, skip base-title-only queries (wrong-match risk)
         if src_mark and not query_has_sequel(query, src_mark) and not sequel_mark(query):
@@ -3114,6 +3115,8 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
         _prefer_kind = folder_media_hint(leaf.get("name") or "")
         tid, how = search_tmdb(query, year, search_cache, prefer_tid=_prefer_tid, prefer_kind=_prefer_kind)
         last_how, last_query = how, query
+        if how == "search_error":
+            saw_search_error = True
         if tid:
             leaf["tmdb"] = tid
             leaf["id_from"] = how
@@ -3154,7 +3157,8 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                 cent.get("tv_tmdb"), cent.get("tv_title") or "",
             )
             return False
-    leaf["id_from"] = last_how or "unresolved"
+    # A later "no results" must not hide that an earlier query failed to reach TMDB.
+    leaf["id_from"] = "search_error" if saw_search_error else (last_how or "unresolved")
     leaf["search_query"] = last_query or (queries[0] if queries else "")
     leaf["search_year"] = year
     return False
