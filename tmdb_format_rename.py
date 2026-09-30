@@ -22,6 +22,7 @@ Loose videos at root/dump dirs are wrapped into folders first (not inside collec
 """
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -201,6 +202,33 @@ _SEASON_TOKENS = re.compile(
     r"|第\s*[一二三四五六七八九十百零两\d]+(?:\s*[-–~至到]\s*[一二三四五六七八九十百零两\d]+)?\s*季"
     r"|全\s*[一二三四五六七八九十\d]+\s*季"
 )
+
+
+# Site / quality / language tags that wrap real titles in Chinese release names:
+# 【高清电影】阿尔卑斯[2011][1080P][国英双语]
+_SITE_WORDS = (
+    r"www\.|\.com\b|\.net\b|\.cc\b|\.org\b|\.tv\b|高清|电影|剧集|电视剧|蓝光|原盘|国语|粤语|英语|国英|国粤|双语|中字|中英|"
+    r"字幕|发布|压制|下载|迅雷|全\d+集|共\d+集|更新|完结|超清|字幕组|论坛|影视|无删减|未删减|导演剪辑|加长|修复|"
+    r"\bBT\b|1080|720|2160|4K|BluRay|WEB-?DL|REMUX|x26[45]|HEVC"
+)
+_SITE_TAG_RE = re.compile(r"[\[【（(][^\]】）)]*?(?:" + _SITE_WORDS + r")[^\]】）)]*?[\]】）)]", re.I)
+_CN_TAGS_RE = re.compile(
+    r"国英双语|国粤双语|国粤英|中英双语|中英双字|中英字幕|国语中字|粤语中字|国语配音|简繁英?字幕|简体中文|繁体中文|"
+    r"内嵌字幕|外挂字幕|官方中字|高清中字|蓝光原盘|蓝光版|高清版|无删减版|未删减版|导演剪辑版|加长版|修复版|完整版"
+)
+
+
+_EDITION_CUT_RE = re.compile(r"(?i)(?<![A-Za-z])(?:director'?s?|theatrical|extended|final|unrated|ultimate|special|uncut)[\s._\-]+cut(?![A-Za-z])")
+# "...x265-RARBG" / "...WEB-DL-GRP" / "...DTS-HD.MA.5.1-FGT": a release group after a known tech token.
+_TRAILING_GROUP_RE = re.compile(
+    r"(?i)((?:1080p|2160p|720p|480p|bluray|web-?dl|webrip|hdtv|remux|x26[45]|h\.?26[45]|hevc|avc|hdr|\d\.\d)[\s._]*)-[A-Za-z0-9]{2,15}$"
+)
+
+
+def strip_site_tags(s: str) -> str:
+    out = _CN_TAGS_RE.sub(" ", _SITE_TAG_RE.sub(" ", s or ""))
+    out = _TRAILING_GROUP_RE.sub(r"\1", _EDITION_CUT_RE.sub(" ", out))
+    return out if out.strip(" ._-") else (s or "")
 
 
 def strip_season_tokens(s: str) -> str:
@@ -1347,7 +1375,7 @@ def strip_release_junk(s: str) -> str:
 
 
 def clean_query_title(name: str) -> str:
-    s = strip_season_tokens(name or "")
+    s = strip_season_tokens(strip_site_tags(name or ""))
     s = strip_media_hint_tokens(s)
     s = strip_release_junk(s)
     s = TMDB_RE.sub(" ", s)
@@ -1408,7 +1436,7 @@ def extract_search_queries(name: str) -> list[str]:
 
     Tries Chinese bracket titles, Latin show/movie names, then a cleaned full string.
     """
-    name = strip_season_tokens(name or "")
+    name = strip_season_tokens(strip_site_tags(name or ""))
     # collapse_dotted_acronym
     # leading_num_title_query: 3.from.Hell -> 3 from Hell
     name = re.sub(r"^(\d{1,2})[._\- ]+(?=[A-Za-z])", r"\1 ", (name or "").strip())
@@ -1826,45 +1854,132 @@ def _search_cache_key(q: str, year, prefer_tid: str = "", prefer_kind: str = "")
     prefer_kind = str(prefer_kind or "").strip().lower()
     if prefer_kind not in ("movie", "tv"):
         prefer_kind = ""
-    return f"{q}|{year or ''}|{mode}|{prefer_tid}|{prefer_kind}|u2"
+    return f"{q}|{year or ''}|{mode}|{prefer_tid}|{prefer_kind}|u4"
 
 
 # Set by main() from --accept-uncertain.
 ACCEPT_UNCERTAIN = False
 
 
-def _uncertain_note(q: str, year, chosen_tid, chosen_kind: str, cand_lists: list) -> str:
-    """Why a title-only match (no year in the folder name) is a guess; "" if it is not.
+def _title_similarity(q: str, r: dict) -> float:
+    """1.0 for an exact (normalised) title match, else the best fuzzy ratio over the TMDB titles."""
+    qn = _norm_match_title(q or "")
+    if not qn or not isinstance(r, dict):
+        return 0.0
+    best = 0.0
+    for k in ("title", "name", "original_title", "original_name"):
+        tn = _norm_match_title(r.get(k) or "")
+        if not tn:
+            continue
+        if tn == qn:
+            return 1.0
+        best = max(best, difflib.SequenceMatcher(None, qn, tn).ratio())
+    return best
+
+
+# Below this a hit that only shares a year (or a word) with the folder name is a guess.
+SIMILAR_ENOUGH = 0.8
+
+
+_TECH_CUT_RE = re.compile(
+    r"(?i)[\s._\-\[\(（【](?:2160p|1080p|720p|480p|4k|uhd|blu-?ray|web-?dl|webrip|hdtv|remux|x26[45]|h\.?26[45]|hevc|avc|hdr)(?![A-Za-z0-9])"
+)
+
+
+def folder_title_components(name: str) -> list[str]:
+    """The title text a folder name carries, before year/quality: one entry per script.
+
+    'It.Boy.2013.Extended.Cut.1080p…' -> ['It Boy'];  '飓风营救.Taken.2008.1080p' -> ['飓风营救', 'Taken'].
+    Nothing is dropped as "junk" here, so a word the query builder removed still counts.
+    """
+    n = strip_season_tokens(strip_site_tags(name or ""))
+    n = re.sub(r"\.(mkv|mp4|iso|ts|m2ts|avi|mov|wmv)$", "", n, flags=re.I)
+    years = list(YEAR_RE.finditer(n))
+    cut = years[-1].start(1) if years else len(n)
+    tm = _TECH_CUT_RE.search(n)
+    if tm and tm.start() < cut:
+        cut = tm.start()
+    ref = re.sub(r"[\[\]【】（）()_.\-]+", " ", n[:cut])
+    ref = re.sub(r"\s+", " ", ref).strip()
+    if not ref:
+        return []
+    cjk = " ".join(re.findall(r"[\u4e00-\u9fff·・]+", ref))
+    latin = re.sub(r"\s+", " ", re.sub(r"[\u4e00-\u9fff·・]+", " ", ref)).strip()
+    comps = [ref]
+    if cjk and latin:
+        comps += [cjk, latin]
+    return comps
+
+
+def folder_title_mismatch_note(name: str, titles: list) -> str:
+    """"" when some part of the folder's title text matches a matched TMDB title; else why not."""
+    comps = folder_title_components(name)
+    titles = [t for t in (titles or []) if t]
+    if not comps or not titles:
+        return ""
+    best = 0.0
+    for c in comps:
+        cn = _norm_match_title(c)
+        if not cn:
+            continue
+        for t in titles:
+            tn = _norm_match_title(t)
+            if not tn:
+                continue
+            best = max(best, 1.0 if tn == cn else difflib.SequenceMatcher(None, cn, tn).ratio())
+    if best >= SIMILAR_ENOUGH:
+        return ""
+    return f"文件夹名里的标题「{comps[0]}」与搜到的《{titles[0]}》不一致（{best:.0%}）"
+
+
+def _uncertain_note(q: str, year, chosen_tid, chosen_kind: str, cand_lists: list, prefer_kind: str = "") -> str:
+    """Why a match is a guess and must not be renamed unconfirmed; "" if it is not.
 
     cand_lists: [(kind, scored)] with scored = [(score, tid, result)].
-    A match is certain only when the folder has a year, or the chosen hit is the
-    only candidate whose title equals the query. Another same-title candidate, a
-    big popularity lead, or a chosen title that is not exactly the query is a guess.
+    Uncertain when:
+      - the chosen title is not (nearly) the searched title, even if the year fits;
+      - the folder looks like a series (S01, 第一季, episode files) but only a movie matched, or the reverse;
+      - the folder has no year and another candidate has the same title.
     """
-    if year and re.fullmatch(r"\d{4}", str(year)):
-        return ""
     qn = _norm_match_title(q or "")
     if not qn:
         return ""
-    chosen_exact = False
+    chosen_r = None
     others = []
     for kind, scored in cand_lists:
         for item in scored:
             tid, r = str(item[1]), item[2]
             if not isinstance(r, dict):
                 continue
-            if not any(_norm_match_title(r.get(k) or "") == qn for k in ("title", "name", "original_title", "original_name")):
-                continue
             if tid == str(chosen_tid) and kind == chosen_kind:
-                chosen_exact = True
-            else:
+                chosen_r = r
+            elif _title_similarity(q, r) >= 1.0:
                 yr = str(r.get("release_date") or r.get("first_air_date") or "")[:4]
                 others.append(f"{'电影' if kind == 'movie' else '剧集'}《{r.get('title') or r.get('name') or ''}》({yr or '?'}) [tmdbid={tid}]")
+    sim = 1.0
+    if chosen_r is not None:
+        sim = _title_similarity(q, chosen_r)
+        if sim < SIMILAR_ENOUGH:
+            return f"搜到的标题《{chosen_r.get('title') or chosen_r.get('name') or ''}》与文件夹名不相似（{sim:.0%}），只是年份或个别词对上"
+    if prefer_kind in ("movie", "tv") and chosen_kind in ("movie", "tv") and chosen_kind != prefer_kind:
+        return f"文件夹像{'剧集' if prefer_kind == 'tv' else '电影'}，但只匹配到{'剧集' if chosen_kind == 'tv' else '电影'}"
+    if year and re.fullmatch(r"\d{4}", str(year)):
+        return ""
     if others:
         return "无年份，仅凭片名匹配；另有同名候选：" + "、".join(others[:3])
-    if not chosen_exact:
+    if chosen_r is not None and sim < 1.0:
         return "无年份，且搜到的标题与文件夹名不完全一致"
     return ""
+
+
+def _chosen_titles(tid, kind: str, cand_lists: list) -> list:
+    """Title variants (title/name/original_*) of the chosen search result."""
+    for k, scored in cand_lists:
+        for item in scored:
+            if k == kind and str(item[1]) == str(tid) and isinstance(item[2], dict):
+                r = item[2]
+                return [r.get(x) for x in ("title", "name", "original_title", "original_name") if r.get(x)]
+    return []
 
 
 def _scored_has_exact(scored: list, q: str) -> bool:
@@ -2006,7 +2121,7 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
                 if yh:
                     return _from_year_hits(yh)
                 # top title unique but wrong year → try year filter empty → no year match
-                if yh == [] and _year_of(scored[0][2]) and _year_of(scored[0][2]) != str(year):
+                if not yh:
                     hit = _off_by_one_exact(scored)
                     if hit:
                         return hit[1], "search_year", [hit]
@@ -2080,10 +2195,12 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
                 "query": q,
                 "year": year,
                 "via": how,
+                "titles": _chosen_titles(tid, media, [("movie", movie_scored), ("tv", tv_scored)]),
                 "uncertain": _uncertain_note(
                     q, year, tid, media,
                     # A folder hint (S01, 电视剧, ...) settles the side: only rivals on it count.
                     [(k, sc) for k, sc in (("movie", movie_scored), ("tv", tv_scored)) if prefer_kind not in ("movie", "tv") or k == prefer_kind],
+                    prefer_kind,
                 ),
             }
             return str(tid), how if str(how).startswith("search") else "search"
@@ -2248,7 +2365,8 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
         "ok": True, "tmdb": tid, "media": kind,
         "unique": (has_year or len(scored) == 1 or bool(prefer_tid)),
         "query": q, "year": year,
-        "uncertain": _uncertain_note(q, year, tid, kind, [(kind, scored)]),
+        "titles": _chosen_titles(tid, kind, [(kind, scored)]),
+        "uncertain": _uncertain_note(q, year, tid, kind, [(kind, scored)], prefer_kind),
     }
     return tid, how if how.startswith("search") else "search"
 
@@ -2775,16 +2893,24 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
             uniq.sort(key=_wq)
             tid, how = (None, "empty_query")
             query = uniq[0] if uniq else ""
+            guessed = False
             for qtry in uniq:
                 tid, how = search_tmdb(qtry, year, search_cache, prefer_kind=folder_media_hint(d.name))
                 query = qtry
+                if tid and not ACCEPT_UNCERTAIN:
+                    _cent = search_cache.get(_search_cache_key(qtry, year, "", folder_media_hint(d.name) or "")) or {}
+                    if _cent.get("uncertain") or (
+                        folder_title_mismatch_note(d.name, _cent.get("titles") or [])
+                        and folder_title_mismatch_note(base, _cent.get("titles") or [])
+                    ):
+                        # A guess: keep looking for a certain hit with another query.
+                        guessed = True
+                        tid, how = None, "uncertain_title_only"
+                        continue
                 if tid:
                     break
-
-            if tid and not year and not ACCEPT_UNCERTAIN:
-                _cent = search_cache.get(_search_cache_key(query, year, "", folder_media_hint(d.name) or "")) or {}
-                if _cent.get("uncertain"):
-                    tid, how = None, "uncertain_title_only"
+            if not tid and guessed:
+                how = "uncertain_title_only"
 
             if not tid:
                 for vf in files:
@@ -3056,6 +3182,13 @@ def _try_unique_title_search(leaf: dict, search_cache: dict) -> bool:
     return False
 
 
+def _cjk_qualifier(name: str) -> tuple[str, str]:
+    """'维兰德（瑞典版）.Wallander…' -> ('维兰德', '瑞典版'): a version tag after a Chinese title."""
+    n = strip_season_tokens(strip_site_tags(name or ""))
+    m = re.match(r"^\s*([\u4e00-\u9fff·・]{2,30})[（(]([\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9 ·・]{0,14})[）)]", n)
+    return (m.group(1), m.group(2)) if m else ("", "")
+
+
 def _leaf_media_hint(leaf: dict) -> str | None:
     """'tv'/'movie'/None for a leaf: name hint, a Season-folder show, or episode files."""
     hint = folder_media_hint(leaf.get("name") or "")
@@ -3206,6 +3339,10 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                 year = extract_year(parent_name)
     parent_only = {q.strip().lower() for q in parent_queries if q} - parent_own
     queries.extend(parent_queries)
+    # "维兰德（瑞典版）": also search with the version tag, which may be part of the TMDB title.
+    qual_core, qual = _cjk_qualifier(leaf.get("name") or "")
+    if qual:
+        queries.append(f"{qual_core} {qual}")
     # Prefer sequel-bearing queries first; never lock onto a base-title hit when
     # the source has a sequel mark (强奸男2 / 聚会的目的2). Then prefer longer.
     # The parent's trailing digit (a library root called "Movies2") is not a sequel
@@ -3215,7 +3352,7 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
         sequel_mark(strip_season_tokens(parent_name or "")) if parent_queries and not has_own_queries else ""
     )
     def _q_rank(q: str):
-        junk = 1 if re.search(r"\d{4}\s*[–—\-]\s*\d{4}", q) or re.search(r"\b(?:19|20)\d{2}\b", q) else 0
+        junk = 1 if re.search(r"\d{4}\s*[–—\-]\s*\d{4}", q) or (re.search(r"\b(?:19|20)\d{2}\b", q) and not re.fullmatch(r"\d{1,4}", q.strip())) else 0
         has_seq = 0 if (src_mark and query_has_sequel(q, src_mark)) or sequel_mark(q) else 1
         return (1 if q.strip().lower() in parent_only else 0, junk, has_seq, -len(q))
     # de-dupe
@@ -3231,6 +3368,10 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
     last_how = "empty_query"
     last_query = ""
     saw_search_error = False
+    # An uncertain or ambiguous answer to one query must not stop the others: a
+    # cleaner query may still give a certain hit. Keep the first such answer and
+    # report it only if no query does.
+    pending: dict | None = None
     for query in queries:
         # If source is clearly a sequel, skip base-title-only queries (wrong-match risk)
         if src_mark and not query_has_sequel(query, src_mark) and not sequel_mark(query):
@@ -3246,17 +3387,25 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                 _search_cache_key(query, year, _prefer_tid or "", _prefer_kind or "")
             )
             note = (cent or {}).get("uncertain") if isinstance(cent, dict) else ""
-            if note and not year:
-                leaf["uncertain"] = note
+            if not note and qual and _norm_match_title(qual) not in _norm_match_title(query):
+                note = f"文件夹名里的「{qual}」没有出现在搜索词里，可能是另一个版本"
+            if not note and isinstance(cent, dict) and not (_prefer_tid and str(_prefer_tid) == str(tid)):
+                # The query builder may have dropped a word of the real title (It Boy -> Boy).
+                note = folder_title_mismatch_note(leaf.get("name") or "", cent.get("titles") or [])
+            if note:
                 if not ACCEPT_UNCERTAIN:
-                    # Title-only guess: report it, do not rename unless confirmed.
-                    leaf["id_from"] = "uncertain_title_only"
-                    leaf["reason"] = "uncertain_title_only"
-                    leaf["note"] = f"{note} | 候选: {(cent or {}).get('media') or ''} [tmdbid={tid}]"
-                    leaf["search_query"] = query
-                    leaf["search_year"] = year
-                    leaf["candidate_tmdb"] = str(tid)
-                    return False
+                    # A guess: report it, do not rename unless confirmed.
+                    if pending is None:
+                        pending = {
+                            "id_from": "uncertain_title_only",
+                            "reason": "uncertain_title_only",
+                            "note": f"{note} | 候选: {(cent or {}).get('media') or ''} [tmdbid={tid}]",
+                            "search_query": query,
+                            "candidate_tmdb": str(tid),
+                            "uncertain": note,
+                        }
+                    continue
+                leaf["uncertain"] = note
             leaf["tmdb"] = tid
             leaf["id_from"] = how
             leaf["search_query"] = query
@@ -3281,18 +3430,23 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
             cent = search_cache.get(
                 _search_cache_key(query, year, _prefer_tid or "", _prefer_kind or "")
             ) or {}
-            leaf["ambiguous"] = True
-            leaf["id_from"] = "ambiguous_movie_and_tv"
-            leaf["reason"] = "ambiguous_movie_and_tv"
-            leaf["search_query"] = query
-            leaf["search_year"] = year
-            leaf["movie_tmdb"] = cent.get("movie_tmdb")
-            leaf["tv_tmdb"] = cent.get("tv_tmdb")
-            leaf["note"] = "电影候选=%s %s / 剧集候选=%s %s" % (
-                cent.get("movie_tmdb"), cent.get("movie_title") or "",
-                cent.get("tv_tmdb"), cent.get("tv_title") or "",
-            )
-            return False
+            if pending is None or pending.get("reason") != "uncertain_title_only":
+                pending = {
+                    "ambiguous": True,
+                    "id_from": "ambiguous_movie_and_tv",
+                    "reason": "ambiguous_movie_and_tv",
+                    "search_query": query,
+                    "movie_tmdb": cent.get("movie_tmdb"),
+                    "tv_tmdb": cent.get("tv_tmdb"),
+                    "note": "电影候选=%s %s / 剧集候选=%s %s" % (
+                        cent.get("movie_tmdb"), cent.get("movie_title") or "",
+                        cent.get("tv_tmdb"), cent.get("tv_title") or "",
+                    ),
+                }
+    if pending is not None:
+        leaf.update(pending)
+        leaf["search_year"] = year
+        return False
     # A later "no results" must not hide that an earlier query failed to reach TMDB.
     leaf["id_from"] = "search_error" if saw_search_error else (last_how or "unresolved")
     leaf["search_query"] = last_query or (queries[0] if queries else "")
@@ -4107,7 +4261,7 @@ def _zh_reason(code: str) -> str:
         "no_results": "搜索无结果",
         "search_error": "搜索失败",
         "empty_query": "标题为空",
-        "uncertain_title_only": "不确定：无年份，仅凭片名匹配（未改名）",
+        "uncertain_title_only": "不确定：需要确认（未改名）",
     }.get(code or "", code or "?")
 
 
