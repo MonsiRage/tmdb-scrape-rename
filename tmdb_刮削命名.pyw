@@ -52,7 +52,8 @@ def find_python_for_script() -> str:
 def engine_importable() -> bool:
     """True if tmdb_format_rename can be imported (sibling .py or frozen bundle)."""
     try:
-        import tmdb_format_rename  # noqa: F401
+        import importlib
+        importlib.import_module("tmdb_format_rename")
         return True
     except Exception:
         return False
@@ -120,6 +121,7 @@ REASON_ZH = {
     "ambiguous_no_year": "多个候选且无年份",
     "ambiguous_movie_and_tv": "电影和剧集都匹配到了（请确认）",
     "search_error": "搜索出错",
+    "uncertain_title_only": "不确定：无年份，仅凭片名匹配（未改名）",
     "empty_query": "查询为空",
     "no_usable_title": "没有可用标题",
     "rename_failed": "改名失败",
@@ -227,6 +229,16 @@ class App(tk.Tk):
         ttk.Label(
             scope,
             text="勾选后，跳过名字里已有 [tmdbid=] 的文件夹。取消勾选，则整库重新检查。",
+        ).pack(anchor="w", padx=28, pady=(0, 4))
+        self.accept_uncertain_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            scope,
+            text="同时改名「不确定」的匹配",
+            variable=self.accept_uncertain_var,
+        ).pack(anchor="w", padx=8)
+        ttk.Label(
+            scope,
+            text="没写年份、又有同名候选的，默认不改名，列在「未能匹配」里并写明候选。先预览确认，再勾选。",
         ).pack(anchor="w", padx=28, pady=(0, 8))
 
         key_row = ttk.Frame(top)
@@ -278,6 +290,15 @@ class App(tk.Tk):
         except Exception:
             self._only_new = True
 
+    def _sync_accept_uncertain(self) -> None:
+        var = getattr(self, "accept_uncertain_var", None)
+        if var is None:
+            return
+        try:
+            self._accept_uncertain = bool(var.get())
+        except Exception:
+            self._accept_uncertain = False
+
     def _toggle_api_key(self) -> None:
         self._api_key_entry.configure(show="" if self._show_key.get() else "*")
 
@@ -320,6 +341,7 @@ class App(tk.Tk):
             return
         media = "auto"
         self._only_new = bool(self.only_new_var.get()) if getattr(self, "only_new_var", None) is not None else bool(getattr(self, "_only_new", True))
+        self._sync_accept_uncertain()
         only_line = "只处理新文件夹，已有 [tmdbid=] 的会跳过。\n" if self._only_new else ""
         # 仅预览：直接开跑，不弹确认框；正式刮削才确认
         if not preview:
@@ -438,6 +460,13 @@ class App(tk.Tk):
             variable=self.only_new_var,
             command=self._sync_only_new,
         ).pack(side=tk.LEFT, padx=(16, 0))
+        self.accept_uncertain_var = tk.BooleanVar(value=bool(getattr(self, "_accept_uncertain", False)))
+        ttk.Checkbutton(
+            bar,
+            text="同时改名不确定的",
+            variable=self.accept_uncertain_var,
+            command=self._sync_accept_uncertain,
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
         self.btn_stop = ttk.Button(bar, text="停止", command=self._stop)
         self.btn_stop.pack(side=tk.RIGHT)
@@ -632,7 +661,7 @@ class App(tk.Tk):
         wrap_count = int(data.get("wrapped_count") or len(wrapped))
         skip_count = int(data.get("skip_count") or len(skip))
         ok_count = len(ok_list)
-        fail_count = 0  # filled after problem rows built
+        
 
         mode = "仅预览" if preview else "正式刮削"
         tip = ""
@@ -662,7 +691,7 @@ class App(tk.Tk):
             "",
             "分类说明：",
             f"  · 电影识别 / 剧集识别（{leaf_count}）：已拿到 TMDB 编号",
-            f"  · 未能匹配：搜不到 / 电影剧集都命中(重复) / 刮削或改名失败等，原因见列表说明列",
+            "  · 未能匹配：搜不到 / 电影剧集都命中(重复) / 不确定 / 刮削或改名失败等，原因见列表说明列",
             f"  · 更改（含散落整理 {wrap_count}）：文件夹改名 + 散落建夹改标题；待改 {plan_count}，已改 {ok_count}",
             f"  · 跳过已刮削：{int(data.get('skipped_done_count') or 0)}（名字里已有 [tmdbid=]，本次不联网、不改文件）",
             "",
@@ -834,7 +863,6 @@ class App(tk.Tk):
 
         self._fill_tree("unmatched", um_rows)
         self._set_tab_title("unmatched", "未能匹配", len(um_rows))
-        fail_count = len(um_rows)
 
         self.summary.configure(
             text=(
@@ -882,6 +910,9 @@ class App(tk.Tk):
         cli = [str(root), f"--media={media}"]
         if getattr(self, "_only_new", False):
             cli.append("--only-new")
+        self._sync_accept_uncertain()
+        if getattr(self, "_accept_uncertain", False):
+            cli.append("--accept-uncertain")
         if preview:
             cli.append("--preview")
         self._log("=" * 60)
