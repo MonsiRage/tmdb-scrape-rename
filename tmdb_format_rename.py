@@ -1613,6 +1613,13 @@ def query_has_sequel(q: str, mark: str) -> bool:
 
 
 
+def is_finished_scrape(leaf: dict) -> bool:
+    """A previous run already renamed this folder to include [tmdbid=N]."""
+    if (leaf or {}).get("id_from") != "bracket_tmdbid":
+        return False
+    return str((leaf or {}).get("tmdb") or "").strip().isdigit()
+
+
 def extract_id_from_name(name: str):
     """Return (tmdb_id, how) or (None, None)."""
     n = (name or "").strip()
@@ -3806,7 +3813,7 @@ def normalize_root_arg(raw: str) -> tuple[Path, list[str]]:
     """
     extra: list[str] = []
     s = (raw or "").strip().strip('"')
-    for flag in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo"):
+    for flag in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new"):
         if flag in s:
             extra.append(flag)
             idx = s.find(flag)
@@ -4028,6 +4035,7 @@ def main():
     no_poster = "--no-poster" in args
     no_nfo = "--no-nfo" in args
     preview_nfo = "--preview-nfo" in args
+    only_new = "--only-new" in args
     media = "auto"
     if "--tv" in args or "--media=tv" in args:
         media = "tv"
@@ -4043,7 +4051,7 @@ def main():
     args = [
         a
         for a in args
-        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--tv", "--media=tv", "--media=movie", "--media=auto")
+        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--tv", "--media=tv", "--media=movie", "--media=auto")
         and not a.startswith("--media=")
     ]
     if not args:
@@ -4058,6 +4066,8 @@ def main():
             no_nfo = True
         if "--preview-nfo" in glued:
             preview_nfo = True
+        if "--only-new" in glued:
+            only_new = True
     try:
         root = root.resolve()
     except Exception:
@@ -4106,6 +4116,10 @@ def main():
         nfo_mode = "写入（仅当文件夹还没有 nfo）"
     print(f"NFO文件 = {nfo_mode}", flush=True)
     print("网页快照 = 生成 tmdb.html（正式更改时写入；预览只显示计划）", flush=True)
+    print(
+        "增量刮削 = 只处理新文件夹（跳过名字里已有 [tmdbid=] 的）" if only_new else "增量刮削 = 关闭（已刮削的也会再检查）",
+        flush=True,
+    )
     print("=" * 60, flush=True)
     if not root.exists() or not root.is_dir():
         print("错误：扫描目录不存在，或不是文件夹", flush=True)
@@ -4119,6 +4133,16 @@ def main():
     tagged, untagged = collect_candidate_dirs(root)
     print(f"  文件夹名已带 TMDB编号: {len(tagged)}", flush=True)
     print(f"  尚未带编号的视频文件夹: {len(untagged)}", flush=True)
+    skipped_done: list = []
+    if only_new:
+        stay = []
+        for leaf in tagged:
+            if is_finished_scrape(leaf):
+                skipped_done.append(leaf)
+            else:
+                stay.append(leaf)
+        tagged = stay
+        print(f"  跳过已刮削（名字已含 [tmdbid=]）: {len(skipped_done)}", flush=True)
 
     search_cache = load_json(SEARCH_CACHE_PATH)
     leaves = list(tagged)
@@ -4389,6 +4413,8 @@ def main():
         "skip_count": len(skip),
         "unresolved_count": len(unresolved),
         "wrapped_count": len(wrapped),
+        "skipped_done_count": len(skipped_done),
+        "only_new": only_new,
         "leaves": leaves,
         "unresolved": unresolved,
         "wrapped": wrapped,
@@ -4501,6 +4527,8 @@ def main():
     print(f"  已识别电影文件夹 = {len(leaves)}", flush=True)
     print(f"  待改名 = {len(plan)}", flush=True)
     print(f"  已正确命名（无需改） = {already_ok_n}", flush=True)
+    if only_new:
+        print(f"  跳过已刮削（未联网） = {len(skipped_done)}", flush=True)
     print(f"  未能匹配（已跳过） = {unmatched_n}", flush=True)
     print(f"  散落视频整理 = {len(wrapped)}", flush=True)
     print(f"  改名成功 = {len(ok)}", flush=True)

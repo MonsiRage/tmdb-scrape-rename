@@ -178,14 +178,15 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("TMDB 刮削命名")
-        self.geometry("760x360")
-        self.minsize(620, 330)
+        self.geometry("760x430")
+        self.minsize(640, 400)
         self.tools = find_tools_dir()
         self.script = self.tools / "tmdb_format_rename.py"
         self.proc = None
         self._scan_root: Path | None = None
         self._last_was_preview = False
         self._media = "auto"
+        self._only_new = True
         self._build_chooser()
         self._stop_flag = False
         if not engine_ready(self.script):
@@ -235,6 +236,12 @@ class App(tk.Tk):
             top,
             text="每次同时搜索电影与剧集：只命中一边进对应标签；重复或刮削不到的都进「未能匹配」（说明写在行内）。",
             foreground="#666",
+        ).pack(anchor="w", pady=(0, 8))
+        self.only_new_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            top,
+            text="只刮削新添加的（跳过名字里已有 [tmdbid=] 的文件夹，不联网、不改文件）",
+            variable=self.only_new_var,
         ).pack(anchor="w", pady=(0, 12))
 
         btns = ttk.Frame(top)
@@ -296,12 +303,15 @@ class App(tk.Tk):
             )
             return
         media = "auto"
+        self._only_new = bool(self.only_new_var.get()) if getattr(self, "only_new_var", None) is not None else bool(getattr(self, "_only_new", True))
+        only_line = "只处理新文件夹，已有 [tmdbid=] 的会跳过。\n" if self._only_new else ""
         # 仅预览：直接开跑，不弹确认框；正式刮削才确认
         if not preview:
             ok = messagebox.askyesno(
                 "确认刮削",
                 (
                     f"媒体: 自动（电影+剧集双搜）\n模式: 正式更改\n目录: {root}\n\n"
+                    f"{only_line}"
                     "两边都命中的会进失败栏，不改名。确定开始？"
                 ),
             )
@@ -608,7 +618,8 @@ class App(tk.Tk):
         self.summary.configure(
             text=(
                 f"【{media_zh}】{mode}完成 · 已识别 {leaf_count} · 更改(待) {plan_count} · "
-                f"已正确命名 {len(already_ok)} · 未能匹配 {len(unmatched)} · "
+                f"已正确命名 {len(already_ok)} · 跳过已刮削 {int(data.get('skipped_done_count') or 0)} · "
+                f"未能匹配 {len(unmatched)} · "
                 f"散落(入更改) {wrap_count} · 改名成功 {ok_count}"
                 + tip
             )
@@ -630,6 +641,7 @@ class App(tk.Tk):
             f"  · 电影识别 / 剧集识别（{leaf_count}）：已拿到 TMDB 编号",
             f"  · 未能匹配：搜不到 / 电影剧集都命中(重复) / 刮削或改名失败等，原因见列表说明列",
             f"  · 更改（含散落整理 {wrap_count}）：文件夹改名 + 散落建夹改标题；待改 {plan_count}，已改 {ok_count}",
+            f"  · 跳过已刮削：{int(data.get('skipped_done_count') or 0)}（名字里已有 [tmdbid=]，本次不联网、不改文件）",
             "",
             f"跳过合计：{skip_count}",
             f"详细 JSON：{last_path}",
@@ -823,7 +835,7 @@ class App(tk.Tk):
             return
         for w in self.winfo_children():
             w.destroy()
-        self.geometry("760x360")
+        self.geometry("760x430")
         self.title("TMDB 刮削命名")
         self._scan_root = None
         self._last_was_preview = False
@@ -844,6 +856,8 @@ class App(tk.Tk):
         os.environ["PYTHONIOENCODING"] = "utf-8"
         frozen = bool(getattr(sys, "frozen", False))
         cli = [str(root), f"--media={media}"]
+        if getattr(self, "_only_new", False):
+            cli.append("--only-new")
         if preview:
             cli.append("--preview")
         self._log("=" * 60)
