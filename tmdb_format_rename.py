@@ -436,7 +436,48 @@ def _normalize_tv_payload(d):
     return out
 
 
-def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str = "") -> str:
+NAME_TEMPLATE = ""      # e.g. "{title} ({year}) [tmdbid={tid}]"; empty = the default pattern
+TITLE_LANG = "auto"     # auto (Chinese first) | zh-TW | en | original
+DEFAULT_TEMPLATE = "{title} ({year}) [tmdbid={tid}]"
+
+
+def valid_template(tpl: str) -> bool:
+    return bool(tpl) and "{title}" in tpl and not re.search(r"\{(?!title\}|year\}|tid\}|original\}|edition\})", tpl)
+
+
+def render_name(tpl: str, title: str, year, tid, original: str = "", edition: str = "") -> str:
+    """Fill a naming template. Tokens: {title} {year} {tid} {original} {edition}.
+    Empty tokens vanish together with their brackets; the [tmdbid=N] tag is always kept."""
+    vals = {
+        "title": title or "",
+        "year": str(year) if year and re.fullmatch(r"\d{4}", str(year)) else "",
+        "tid": str(tid or ""),
+        "original": original or "",
+        "edition": edition or "",
+    }
+    out = tpl
+    for k, v in vals.items():
+        if not v:
+            out = re.sub(r"[\(\[（【]\s*\{%s\}\s*[\)\]）】]" % k, "", out)
+            out = out.replace("{%s}" % k, "")
+    for k, v in vals.items():
+        out = out.replace("{%s}" % k, v)
+    out = re.sub(r"\s{2,}", " ", out).strip(" ._-")
+    out = re.sub(r"(?:\s[-–]\s*)+$", "", out)
+    if vals["tid"] and "[tmdbid=" not in out:
+        out += f" [tmdbid={vals['tid']}]"
+    return out
+
+
+def edition_of(text: str) -> str:
+    for pat, lab in _VERSION_EDITIONS:
+        if re.search(pat, text or "", re.I):
+            return lab
+    return ""
+
+
+def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str = "",
+                    original: str = "", edition: str = "") -> str:
     """Keep full title when path budget allows; shorten only as needed."""
     title = win_safe(title or "") or "untitled"
     year_s = str(year) if year and re.fullmatch(r"\d{4}", str(year)) else ""
@@ -449,6 +490,8 @@ def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str
         return len(name) <= budget
 
     cands = []
+    if NAME_TEMPLATE and tid:
+        cands.append(render_name(NAME_TEMPLATE, title, year_s, tid, original, edition))
     if tid and year_s:
         cands.append(f"{title} ({year_s}) [tmdbid={tid}]")
     if year_s:
@@ -5455,6 +5498,179 @@ def apply_version_names(folder: Path, base: str, label: str, video_names: list) 
                 _rename_one(sc, sdst)
 
 
+def lang_title(meta: dict, mode: str):
+    """The title in the requested language, or None when TMDB has none (caller keeps the default)."""
+    if mode == "original":
+        return (meta.get("original_title") or "").strip() or None
+    if mode == "en":
+        return (meta.get("title_enus") or "").strip() or None
+    if mode == "zh-TW":
+        t = (meta.get("title_twr") or "").strip()
+        return t if readable_han_title(t) else None
+    return None
+
+
+def prefetch_title_lang(leaves: list, cache: dict) -> None:
+    """Fetch the English / Traditional-Chinese titles that the chosen language needs (cached in meta)."""
+    mode = TITLE_LANG
+    if mode not in ("en", "zh-TW"):
+        return
+    field, lang = ("title_enus", "en-US") if mode == "en" else ("title_twr", "zh-TW")
+    todo = {}
+    for L in leaves:
+        if not L.get("tmdb"):
+            continue
+        kind = L.get("media") if L.get("media") in ("movie", "tv") else ("tv" if media_is_tv() else "movie")
+        meta = cache.get(ckey(L["tmdb"], kind))
+        if isinstance(meta, dict) and meta.get("ok") and field not in meta:
+            todo[(str(L["tmdb"]), kind)] = meta
+
+    def one(item):
+        (tid, kind), meta = item
+        d = api_get(f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}&language={lang}")
+        t = ""
+        if isinstance(d, dict) and not d.get("_error"):
+            t = (d.get("title") or d.get("name") or "").strip()
+        meta[field] = t
+        return None
+
+    list(_pmap(one, list(todo.items())))
+
+
+def tv_counts(tid: str, cache: dict) -> dict | None:
+    """{"seasons": n, "episodes": n, "per": {season: episodes}} of a TMDB show (cached 14 days)."""
+    ck = f"tvc:{tid}"
+    c = cache.get(ck)
+    if isinstance(c, dict) and time.time() - c.get("ts", 0) < 14 * 86400 and c.get("per") is not None:
+        return c
+    d = api_get(f"https://api.themoviedb.org/3/tv/{tid}?api_key={API_KEY}&language=zh-CN")
+    if not isinstance(d, dict) or d.get("_error"):
+        return None
+    per = {}
+    for se in d.get("seasons") or []:
+        if isinstance(se, dict) and se.get("season_number") is not None:
+            per[str(se["season_number"])] = int(se.get("episode_count") or 0)
+    out = {
+        "ts": time.time(),
+        "seasons": int(d.get("number_of_seasons") or len([k for k in per if k != "0"])),
+        "episodes": int(d.get("number_of_episodes") or 0),
+        "per": per,
+    }
+    cache[ck] = out
+    return out
+
+
+_EP_SEASON_RE = re.compile(r"(?i)(?<![A-Za-z0-9])S(\d{1,2})[\s._]*E\d{1,3}")
+
+
+def local_season_counts(folder: Path) -> dict:
+    """{season_no: episode_file_count} of the video files under a show folder (extras skipped)."""
+    out: dict = {}
+    stack = [(folder, None)]
+    seen = 0
+    while stack and seen < 5000:
+        d, dir_season = stack.pop()
+        for n, isd, isf in _entries(d):
+            if isd:
+                if should_prune(n) or is_extras_dir(n) or n.lower() in DISC_DIR_NAMES:
+                    continue
+                sn = season_number_from_name(n) if is_season_dir_name(n) else None
+                stack.append((d / n, sn if sn is not None else dir_season))
+            elif isf and Path(n).suffix.lower() in VIDEO:
+                seen += 1
+                m = _EP_SEASON_RE.search(n)
+                sn = int(m.group(1)) if m else dir_season
+                if sn is not None:
+                    out[sn] = out.get(sn, 0) + 1
+    return out
+
+
+def check_tv_episodes(leaves: list, cache: dict) -> tuple[list, list]:
+    """Cross-check TV leaves with TMDB's season / episode counts. Returns (kept, flagged).
+
+    More seasons (or clearly more episodes in a season) on disk than the matched show has is
+    impossible; if another show with the same title does fit, the leaf is listed as uncertain.
+    Fewer than TMDB lists is normal (partial libraries) and never flagged."""
+    kept, flagged = [], []
+
+    def fits(counts, loc):
+        if not counts:
+            return True
+        for sn, n in loc.items():
+            if sn == 0:
+                continue
+            if sn > counts["seasons"]:
+                return False
+            per = counts["per"].get(str(sn))
+            if per and n > per * 1.3 + 3:
+                return False
+        return True
+
+    def one(L):
+        media = L.get("media") or ("tv" if media_is_tv() else "movie")
+        if media != "tv" or not L.get("tmdb") or L.get("id_from") == "user_choice":
+            return L, None
+        loc = local_season_counts(Path(L["path"]))
+        if not loc:
+            return L, None
+        tid = str(L["tmdb"])
+        counts = tv_counts(tid, cache)
+        if not counts:
+            return L, None
+        if fits(counts, loc):
+            L["episode_check"] = "ok"
+            return L, None
+        name = L.get("name") or ""
+        q = L.get("search_query") or clean_query_title(strip_season_tokens(name))
+        try:
+            found = _search_tmdb_one_kind("tv", q, None)
+        except Exception:
+            found = []
+        pool = [(t2, r) for (_sc, t2, r) in found if str(t2) != tid and isinstance(r, dict) and _title_similarity(q, r) >= 1.0]
+        rivals, fit = [], []
+        for t2, r in pool[:5]:
+            c2 = tv_counts(str(t2), cache)
+            cand = {
+                "media": "tv", "tmdb": str(t2), "title": r.get("name") or r.get("title") or "",
+                "original": r.get("original_name") or "", "year": str(r.get("first_air_date") or "")[:4],
+                "country": "", "lang": r.get("original_language") or "",
+                "seasons": c2["seasons"] if c2 else None,
+            }
+            rivals.append(cand)
+            if c2 and fits(c2, loc):
+                fit.append(cand)
+        meta = cache.get(ckey(tid, "tv")) or {}
+        own = {
+            "media": "tv", "tmdb": tid, "title": meta.get("picked_title") or "", "original": meta.get("original_title") or "",
+            "year": str(meta.get("year") or "")[:4], "country": "", "lang": "", "seasons": counts["seasons"],
+        }
+        have = "、".join(f"第{k}季{v}集" for k, v in sorted(loc.items()))
+        L["episode_check"] = "mismatch"
+        if fit:
+            best = fit[0]
+            note = (f"文件夹里有 {have}，超出所选《{own['title']}》（共{counts['seasons']}季）的范围，"
+                    f"但《{best['title']}》({best['year']}，{best['seasons']}季) 吻合")
+            return L, {"note": note, "candidates": [own] + fit + [c for c in rivals if c not in fit]}
+        L["episode_note"] = f"文件夹里有 {have}，但 TMDB 只有 {counts['seasons']} 季（可能是分季编号不同）"
+        return L, None
+
+    for L, flag in _pmap(one, leaves):
+        if flag and not ACCEPT_UNCERTAIN:
+            L2 = dict(L)
+            L2.pop("tmdb", None)
+            L2.update({
+                "id_from": "uncertain_title_only",
+                "reason": "uncertain_title_only",
+                "note": flag["note"] + (" | " + candidates_note(flag["candidates"], 4) if flag["candidates"] else ""),
+                "candidates": flag["candidates"],
+                "candidate_tmdb": str(L.get("tmdb")),
+            })
+            flagged.append(L2)
+        else:
+            kept.append(L)
+    return kept, flagged
+
+
 def check_movie_durations(leaves: list, cache: dict) -> tuple[list, list]:
     """Cross-check movie leaves with the length of their video. Returns (kept, flagged).
 
@@ -5569,8 +5785,20 @@ def main():
     no_nfo = "--no-nfo" in args
     preview_nfo = "--preview-nfo" in args
     only_new = "--only-new" in args
-    global MERGE_SEASONS
+    global MERGE_SEASONS, NAME_TEMPLATE, TITLE_LANG
     MERGE_SEASONS = "--no-merge-seasons" not in args
+    TITLE_LANG = "auto"
+    NAME_TEMPLATE = ""
+    for a in args:
+        if a.startswith("--title-lang="):
+            v = a.split("=", 1)[1].strip()
+            TITLE_LANG = v if v in ("auto", "zh-TW", "en", "original") else "auto"
+        elif a.startswith("--name-template="):
+            v = a.split("=", 1)[1].strip().strip('"')
+            if valid_template(v):
+                NAME_TEMPLATE = v if v != DEFAULT_TEMPLATE else ""
+            else:
+                print(f"命名模板无效（必须含 {{title}}，只能用 {{title}} {{year}} {{tid}} {{original}} {{edition}}），已改用默认格式：{v}", flush=True)
     global ACCEPT_UNCERTAIN
     ACCEPT_UNCERTAIN = "--accept-uncertain" in args
     media = "auto"
@@ -5590,6 +5818,8 @@ def main():
         for a in args
         if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--accept-uncertain", "--no-merge-seasons", "--tv", "--media=tv", "--media=movie", "--media=auto")
         and not a.startswith("--media=")
+        and not a.startswith("--title-lang=")
+        and not a.startswith("--name-template=")
     ]
     if not args:
         root = Path(os.environ.get("TMDB_RENAME_ROOT") or os.getcwd())
@@ -5805,11 +6035,23 @@ def main():
         unresolved.extend(dur_flagged)
         save_json(CACHE_PATH, cache)
 
+    # TV: do the seasons / episodes on disk fit the show we matched?
+    leaves, ep_flagged = check_tv_episodes(leaves, cache)
+    for L in leaves:
+        if L.get("episode_note"):
+            print(f"  集数提示: {(L.get('name') or '')[:60]} | {L['episode_note']}", flush=True)
+    for L in ep_flagged:
+        print(f"  集数对不上: {(L.get('name') or '')[:60]} | {L.get('note')}", flush=True)
+    unresolved.extend(ep_flagged)
+    save_json(CACHE_PATH, cache)
+
     # Multi-disc sibling folders (D1/D2…) sharing parent+tmdb → one folder
     leaves, multidisc_skips = collapse_multidisc_leaves(leaves, root)
     plan, skip = [], []
     skip.extend(multidisc_skips)
     multidisc_dest_by_primary = {}
+    prefetch_title_lang(leaves, cache)
+    save_json(CACHE_PATH, cache)
     used = {}
     dupgroups: dict = {}
     for L in leaves:
@@ -5819,6 +6061,10 @@ def main():
         if meta.get("ok") and meta.get("picked_title"):
             title, year, lang = picked_title_from_cache(meta)
             source = "tmdb"
+            if TITLE_LANG != "auto":
+                alt = lang_title(meta, TITLE_LANG)
+                if alt:
+                    title, lang = alt, TITLE_LANG
         if not title:
             nfo = find_nfo_meta(Path(L["path"]))
             t = (nfo.get("title") or nfo.get("originaltitle") or "").strip()
@@ -5830,7 +6076,11 @@ def main():
             continue
         parent = L["parent"]
         try:
-            target = fit_folder_name(title, year, tid, Path(parent))
+            target = fit_folder_name(
+                title, year, tid, Path(parent),
+                original=(meta.get("original_title") or ""),
+                edition=edition_of(L["name"] + " " + " ".join(_leaf_video_stems(Path(L["path"]), 4))),
+            )
         except Exception:
             target = build_name(title, year, tid)
         key = (parent.lower(), target.lower())

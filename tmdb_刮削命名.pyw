@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -89,6 +90,41 @@ def read_saved_api_key() -> str:
     except Exception:
         pass
     return (os.environ.get("TMDB_API_KEY") or "").strip()
+
+
+LANG_CHOICES = {"自动（中文优先）": "auto", "繁体中文": "zh-TW", "英文": "en", "原名": "original"}
+DEFAULT_TEMPLATE = "{title} ({year}) [tmdbid={tid}]"
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads((data_dir() / "gui_settings.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_settings(d: dict) -> None:
+    try:
+        (data_dir() / "gui_settings.json").write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def last_history() -> dict | None:
+    """The newest change-history file of a real run (what 撤销上次改名 would undo)."""
+    d = data_dir() / "history"
+    try:
+        files = sorted(d.glob("*.json"))
+    except Exception:
+        return None
+    for f in reversed(files):
+        try:
+            h = json.loads(f.read_text(encoding="utf-8"))
+            if h.get("ops"):
+                return h
+        except Exception:
+            continue
+    return None
 
 
 class _LineWriter:
@@ -188,8 +224,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("TMDB 刮削命名")
-        self.geometry("760x560")
-        self.minsize(680, 520)
+        self.geometry("760x700")
+        self.minsize(680, 640)
         self.tools = find_tools_dir()
         self.script = self.tools / "tmdb_format_rename.py"
         self.proc = None
@@ -246,8 +282,35 @@ class App(tk.Tk):
         ).pack(anchor="w", padx=8)
         ttk.Label(
             scope,
-            text="标题对不上、没写年份又有同名候选、或剧集/电影类型对不上的，默认不改名，列在「未能匹配」里并写明原因和候选。先预览确认，再勾选。",
+            text="标题对不上、没写年份又有同名候选、或剧集/电影类型对不上的，默认不改名，列在「需要确认」里并写明原因和候选。先预览确认，再勾选。",
         ).pack(anchor="w", padx=28, pady=(0, 8))
+
+        st = load_settings()
+        fmt = ttk.LabelFrame(top, text="命名与语言")
+        fmt.pack(fill=tk.X, pady=(0, 10))
+        r1 = ttk.Frame(fmt)
+        r1.pack(fill=tk.X, padx=8, pady=(6, 2))
+        ttk.Label(r1, text="标题语言").pack(side=tk.LEFT)
+        lang_names = list(LANG_CHOICES)
+        self.lang_var = tk.StringVar(value=st.get("lang") if st.get("lang") in lang_names else lang_names[0])
+        ttk.Combobox(r1, textvariable=self.lang_var, values=lang_names, state="readonly", width=16).pack(side=tk.LEFT, padx=8)
+        ttk.Label(r1, text="只影响文件夹名；找不到该语言的标题时用默认（中文优先）。", foreground="#666").pack(side=tk.LEFT)
+        r2 = ttk.Frame(fmt)
+        r2.pack(fill=tk.X, padx=8, pady=2)
+        ttk.Label(r2, text="命名格式").pack(side=tk.LEFT)
+        self.tpl_var = tk.StringVar(value=st.get("template") or DEFAULT_TEMPLATE)
+        ttk.Entry(r2, textvariable=self.tpl_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        ttk.Button(r2, text="恢复默认", command=lambda: self.tpl_var.set(DEFAULT_TEMPLATE)).pack(side=tk.LEFT)
+        ttk.Label(
+            fmt,
+            text="可用：{title}标题 {year}年份 {tid}编号 {original}原名 {edition}版本（如 Extended）。[tmdbid=编号] 始终保留。",
+            foreground="#666",
+        ).pack(anchor="w", padx=8)
+        ttk.Label(
+            fmt,
+            text="同一部剧各季的独立文件夹会自动合并到「剧名/Season NN」；同一部电影的不同版本会合并并加版本标记。预览里逐条列出，改错可「撤销上次改名」。",
+            foreground="#666", wraplength=700, justify=tk.LEFT,
+        ).pack(anchor="w", padx=8, pady=(0, 6))
 
         key_row = ttk.Frame(top)
         key_row.pack(fill=tk.X, pady=(0, 4))
@@ -267,7 +330,7 @@ class App(tk.Tk):
 
         ttk.Label(
             top,
-            text="每次同时搜索电影与剧集：只命中一边进对应标签；重复或刮削不到的都进「未能匹配」（说明写在行内）。",
+            text="每次同时搜索电影与剧集：只命中一边进对应标签；重复或刮削不到的都进「需要确认」（说明写在行内）。",
             foreground="#666",
         ).pack(anchor="w", pady=(0, 8))
 
@@ -280,6 +343,7 @@ class App(tk.Tk):
             btns, text="确认刮削（正式更改）", command=lambda: self._choose(False)
         ).pack(side=tk.LEFT, padx=(0, 12), ipadx=10, ipady=8)
         ttk.Button(btns, text="退出", command=self.destroy).pack(side=tk.RIGHT, ipadx=10, ipady=8)
+        ttk.Button(btns, text="撤销上次改名", command=self._undo).pack(side=tk.RIGHT, padx=(0, 12), ipadx=10, ipady=8)
         ttk.Label(top, text=f"数据目录: {data_dir()}", foreground="#666").pack(
             anchor="w", pady=(10, 0)
         )
@@ -347,6 +411,11 @@ class App(tk.Tk):
                 "请填写 TMDB API Key。\n它会保存在 %AppData%\\Roaming\\TMDB刮削命名\\tmdb_api_key.txt。",
             )
             return
+        tpl = (self.tpl_var.get() or "").strip()
+        if tpl != DEFAULT_TEMPLATE and ("{title}" not in tpl or re.search(r"\{(?!title\}|year\}|tid\}|original\}|edition\})", tpl)):
+            messagebox.showerror("命名格式无效", "命名格式必须包含 {title}，并且只能用 {title} {year} {tid} {original} {edition}。")
+            return
+        save_settings({"lang": self.lang_var.get(), "template": tpl})
         media = "auto"
         self._only_new = bool(self.only_new_var.get()) if getattr(self, "only_new_var", None) is not None else bool(getattr(self, "_only_new", True))
         self._sync_accept_uncertain()
@@ -443,7 +512,7 @@ class App(tk.Tk):
         except Exception:
             pass
 
-    def _show_runner(self, root: Path, preview: bool, media: str) -> None:
+    def _show_runner(self, root: Path, preview: bool, media: str, cli_override: list | None = None) -> None:
         for w in self.winfo_children():
             w.destroy()
         self.geometry("1000x700")
@@ -486,6 +555,10 @@ class App(tk.Tk):
             bar, text="确认并正式刮削", command=self._confirm_apply, state=tk.DISABLED
         )
         self.btn_apply.pack(side=tk.RIGHT, padx=(0, 8))
+        self.btn_undo = ttk.Button(bar, text="撤销上次改名", command=self._undo)
+        self.btn_undo.pack(side=tk.RIGHT, padx=(0, 8))
+        self.btn_export = ttk.Button(bar, text="导出表格", command=self._export_csv, state=tk.DISABLED)
+        self.btn_export.pack(side=tk.RIGHT, padx=(0, 8))
 
         self.summary = ttk.Label(
             self,
@@ -503,13 +576,13 @@ class App(tk.Tk):
         self.log = scrolledtext.ScrolledText(log_frame, height=20, wrap=tk.WORD, font=("Consolas", 10))
         self.log.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        # Tab order: 概览 → 电影/剧集识别 → 未能匹配(含重复/刮削失败) → 更改(含散落整理)
+        # Tab order: 概览 → 电影/剧集识别 → 需要确认(含重复/刮削失败) → 更改(含散落整理)
         # 「已正确命名」只写在概览/日志，不再单独开标签
         self._result_tab_defs = [
             ("overview", "概览"),
             ("leaves_movie", "电影识别"),
             ("leaves_tv", "剧集识别"),
-            ("unmatched", "未能匹配"),
+            ("unmatched", "需要确认"),
             ("changes", "更改"),
         ]
         for key, title in self._result_tab_defs:
@@ -522,16 +595,23 @@ class App(tk.Tk):
                 self.overview_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
             else:
                 if key == "unmatched":
+                    top_row = ttk.Frame(fr)
+                    top_row.pack(fill=tk.X, padx=8, pady=(6, 0))
                     ttk.Label(
-                        fr,
+                        top_row,
                         text="双击一行：从候选里选一个（或填 TMDB 编号），选完再点「仅预览」/「确认刮削」就会按你的选择处理。",
                         foreground="#555",
-                    ).pack(anchor="w", padx=8, pady=(6, 0))
+                    ).pack(side=tk.LEFT)
+                    self.um_filter = tk.StringVar(value="全部")
+                    cb = ttk.Combobox(top_row, textvariable=self.um_filter, values=["全部", "电影", "剧集"], state="readonly", width=6)
+                    cb.pack(side=tk.RIGHT)
+                    ttk.Label(top_row, text="类型").pack(side=tk.RIGHT, padx=(0, 4))
+                    cb.bind("<<ComboboxSelected>>", lambda e: self._refill_unmatched())
                 self.tab_trees[key] = self._make_scrollable_tree(fr)
                 if key == "unmatched":
                     self.tab_trees[key].bind("<Double-1>", lambda e, t=self.tab_trees[key]: self._pick_candidate(t))
 
-        self._run(root, preview, media)
+        self._run(root, preview, media, cli_override)
 
     def _set_tab_title(self, key: str, title: str, n: int) -> None:
         order = [k for k, _ in self._result_tab_defs]
@@ -565,7 +645,7 @@ class App(tk.Tk):
                 tree.insert("", tk.END, values=(kind, a, b, c))
 
     def _pick_candidate(self, tree: ttk.Treeview) -> None:
-        """Double-click on a row of 未能匹配: choose the right TMDB entry for that folder."""
+        """Double-click on a row of 需要确认: choose the right TMDB entry for that folder."""
         sel = tree.selection()
         if not sel:
             return
@@ -641,6 +721,98 @@ class App(tk.Tk):
             messagebox.showerror("保存失败", str(e))
             return
         messagebox.showinfo("已记住", "已记住你的选择。\n再点一次「仅预览」或「确认刮削」，这个文件夹就会按它处理。")
+
+    @staticmethod
+    def _change_label(rec: dict, base: str) -> str:
+        act = rec.get("action") or ""
+        if act == "merge_version":
+            return f"{base}·合并版本 [{rec.get('version_label') or ''}]"
+        if act == "merge_season":
+            n = rec.get("season_no")
+            return f"{base}·并入 Season {n:02d}" if n is not None else f"{base}·并入剧目录"
+        if rec.get("version_label"):
+            return f"{base}·版本 [{rec['version_label']}]"
+        if rec.get("season_wrap") is not None:
+            return f"{base}·整理为 Season {rec['season_wrap']:02d}"
+        return base
+
+    def _refill_unmatched(self) -> None:
+        rows = getattr(self, "_um_all", [])
+        want = self.um_filter.get() if getattr(self, "um_filter", None) is not None else "全部"
+        shown = [r for r in rows if want == "全部" or r[0] == want]
+        self._fill_tree("unmatched", shown)
+        n = f"{len(shown)}/{len(rows)}" if want != "全部" else str(len(rows))
+        order = [k for k, _ in self._result_tab_defs]
+        self.notebook.tab(1 + order.index("unmatched"), text=f"需要确认 ({n})")
+
+    def _undo(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            messagebox.showwarning("忙", "请先等待当前任务结束。")
+            return
+        h = last_history()
+        if not h:
+            messagebox.showinfo("没有可撤销的改动", "还没有正式更改过，或记录已被清除。")
+            return
+        t = str(h.get("time") or "")
+        if len(t) >= 15:
+            t = f"{t[0:4]}-{t[4:6]}-{t[6:8]} {t[9:11]}:{t[11:13]}"
+        ok = messagebox.askyesno(
+            "撤销上次改名",
+            f"将把 {t} 那一次正式更改还原：\n目录：{h.get('root')}\n共 {len(h.get('ops') or [])} 步"
+            "（改回原文件夹名、拆回合并的版本/季，删除新写入的图片和 nfo）。\n\n确定撤销？",
+        )
+        if not ok:
+            return
+        self._last_was_preview = True
+        self._show_runner(Path(h.get("root") or "."), True, "auto", ["--undo"])
+        self.btn_undo.configure(state=tk.DISABLED)
+
+    def _export_csv(self) -> None:
+        d = getattr(self, "_export_data", None)
+        if not d:
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出表格", defaultextension=".csv", filetypes=[("CSV 表格", "*.csv")],
+            initialfile="tmdb刮削结果.csv",
+        )
+        if not path:
+            return
+        import csv
+        media = d["media"]
+        rows = []
+        done = {r.get("path"): r for r in d["ok"]}
+        for p in d["plan"]:
+            act = p.get("action") or ""
+            if d["preview"]:
+                status = {"merge_version": "待合并版本", "merge_season": "待合并到季"}.get(act, "待改名")
+            else:
+                status = {"merge_version": "已合并版本", "merge_season": "已合并到季"}.get(act, "已改名" if p.get("path") in done else "待改名")
+            rows.append([status, "剧集" if guess_lib_kind(p, media) == "tv" else "电影", p.get("name") or "",
+                         p.get("target") or "", p.get("tmdb") or "",
+                         p.get("version_label") or (f"Season {p['season_no']:02d}" if p.get("season_no") is not None else ""),
+                         p.get("version_info") or "", ""])
+        for r in d["um"]:
+            it = r[4] if len(r) >= 5 and isinstance(r[4], dict) else {}
+            vp = it.get("version_profile") or {}
+            info = ""
+            if vp:
+                bits = []
+                if vp.get("w"):
+                    bits.append(f"{vp['w']}x{vp['h']}")
+                if vp.get("sec"):
+                    bits.append(f"{round(vp['sec'] / 60)}分钟")
+                if vp.get("size"):
+                    bits.append(f"{vp['size'] / 1024 ** 3:.2f}GB" if vp["size"] >= 1024 ** 3 else f"{vp['size'] / 1024 ** 2:.0f}MB")
+                info = " ".join(bits)
+            rows.append(["需要确认", r[0], r[1], "", it.get("tmdb") or it.get("candidate_tmdb") or "", "", info, f"{r[2]} {r[3] if len(r) > 3 else ''}".strip()])
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["状态", "类型", "原文件夹", "新名称", "TMDB编号", "版本/季", "分辨率·片长·大小", "原因/说明"])
+                w.writerows(rows)
+            messagebox.showinfo("已导出", f"共 {len(rows)} 行：\n{path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
 
     def _confirm_apply(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -772,7 +944,7 @@ class App(tk.Tk):
             text=(
                 f"【{media_zh}】{mode}完成 · 已识别 {leaf_count} · 更改(待) {plan_count} · "
                 f"已正确命名 {len(already_ok)} · 跳过已刮削 {int(data.get('skipped_done_count') or 0)} · "
-                f"未能匹配 {len(unmatched)} · "
+                f"需要确认 {len(unmatched)} · "
                 f"散落(入更改) {wrap_count} · 改名成功 {ok_count}"
                 + tip
             )
@@ -792,7 +964,7 @@ class App(tk.Tk):
             "",
             "分类说明：",
             f"  · 电影识别 / 剧集识别（{leaf_count}）：已拿到 TMDB 编号",
-            "  · 未能匹配：搜不到 / 电影剧集都命中(重复) / 不确定 / 刮削或改名失败等，原因见列表说明列",
+            "  · 需要确认：搜不到 / 电影剧集都命中(重复) / 不确定 / 刮削或改名失败等，原因见列表说明列",
             f"  · 更改（含散落整理 {wrap_count}）：文件夹改名 + 散落建夹改标题；待改 {plan_count}，已改 {ok_count}",
             f"  · 跳过已刮削：{int(data.get('skipped_done_count') or 0)}（名字里已有 [tmdbid=]，本次不联网、不改文件）",
             "",
@@ -832,7 +1004,7 @@ class App(tk.Tk):
 
         # 已正确命名：不单独建标签，数量见概览/日志
 
-        # 「未能匹配」在后面统一填入（含重复 / 刮削失败）
+        # 「需要确认」在后面统一填入（含重复 / 刮削失败）
 
         # 「更改」：预览=待更改；确认后=已更改。同一批只显示一种，不重复两条。
         change_rows = []
@@ -842,7 +1014,7 @@ class App(tk.Tk):
                     (
                         ("剧集" if guess_lib_kind(p, media) == "tv" else "电影"),
                         p.get("name") or p.get("path") or "",
-                        "待更改",
+                        self._change_label(p, "待更改"),
                         f"→ {p.get('target') or p.get('dest') or ''}",
                     )
                 )
@@ -856,7 +1028,7 @@ class App(tk.Tk):
                     (
                         ("剧集" if guess_lib_kind(r, media) == "tv" else "电影"),
                         r.get("name") or r.get("path") or "",
-                        label,
+                        self._change_label(r, label),
                         r.get("final")
                         or r.get("dest")
                         or (f"→ {r.get('target')}" if r.get("target") else "")
@@ -965,13 +1137,18 @@ class App(tk.Tk):
                 best[key] = row  # keep richer note
         um_rows = list(best.values())
 
-        self._fill_tree("unmatched", um_rows)
-        self._set_tab_title("unmatched", "未能匹配", len(um_rows))
+        self._um_all = um_rows
+        self._refill_unmatched()
+        self._export_data = {"plan": plan, "ok": ok_list, "skip": skip, "unresolved": unresolved, "um": um_rows, "media": media, "preview": preview}
+        try:
+            self.btn_export.configure(state=tk.NORMAL)
+        except Exception:
+            pass
 
         self.summary.configure(
             text=(
                 f"【{media_zh}】{mode}完成 · 已识别 {leaf_count} · 更改(待) {plan_count} · "
-                f"已正确命名 {len(already_ok)} · 未能匹配 {len(um_rows)} · "
+                f"已正确命名 {len(already_ok)} · 需要确认 {len(um_rows)} · "
                 f"散落(入更改) {wrap_count} · 更改(已) {ok_count}"
                 + tip
             )
@@ -990,7 +1167,7 @@ class App(tk.Tk):
             return
         for w in self.winfo_children():
             w.destroy()
-        self.geometry("760x560")
+        self.geometry("760x700")
         self.title("TMDB 刮削命名")
         self._scan_root = None
         self._last_was_preview = False
@@ -1000,8 +1177,8 @@ class App(tk.Tk):
         self.log.insert(tk.END, line.rstrip() + "\n")
         self.log.see(tk.END)
 
-    def _run(self, root: Path, preview: bool, media: str) -> None:
-        if not self._persist_api_key():
+    def _run(self, root: Path, preview: bool, media: str, cli_override: list | None = None) -> None:
+        if not cli_override and not self._persist_api_key():
             messagebox.showerror(
                 "缺少 API Key",
                 "请回到首页填写 TMDB API Key。\n它会保存在 %AppData%\\Roaming\\TMDB刮削命名\\tmdb_api_key.txt。",
@@ -1019,6 +1196,15 @@ class App(tk.Tk):
             cli.append("--accept-uncertain")
         if preview:
             cli.append("--preview")
+        st = load_settings()
+        lang = LANG_CHOICES.get(st.get("lang") or "", "auto")
+        if lang != "auto":
+            cli.append(f"--title-lang={lang}")
+        tpl = (st.get("template") or "").strip()
+        if tpl and tpl != DEFAULT_TEMPLATE:
+            cli.append(f"--name-template={tpl}")
+        if cli_override:
+            cli = list(cli_override)
         self._log("=" * 60)
         if frozen:
             self._log(("PREVIEW " if preview else "APPLY ") + "(portable exe, in-process) " + " ".join(cli))
@@ -1089,7 +1275,10 @@ class App(tk.Tk):
                 self.after(0, self.btn_stop.configure, {"state": tk.DISABLED})
                 self.after(0, self.btn_again.configure, {"state": tk.NORMAL})
                 self.after(0, self.btn_reload.configure, {"state": tk.NORMAL})
-                self.after(0, self._load_results)
+                if cli_override:
+                    self.after(0, self.summary.configure, {"text": "撤销完成，详情见「运行日志」。需要时点「重新选择」回到首页。"})
+                else:
+                    self.after(0, self._load_results)
 
         threading.Thread(target=worker, daemon=True).start()
 
