@@ -23,10 +23,12 @@ Loose videos at root/dump dirs are wrapped into folders first (not inside collec
 from __future__ import annotations
 
 import difflib
+import http.client
 import json
 import os
 import re
 import shutil
+import ssl
 import sys
 import threading
 import time
@@ -279,45 +281,65 @@ def strip_media_hint_tokens(s: str) -> str:
 
 
 
-_TMDB_TV_EXISTS_CACHE: dict[str, bool] = {}
-_TMDB_MOVIE_EXISTS_CACHE: dict[str, bool] = {}
+# Does id N exist on the movie / TV endpoint? Asked for every [tmdbid=N] folder to tell a
+# movie from a show that shares the number. The answer is kept on disk (an id that is
+# there stays there), so a rescan of a big library does not ask again. Only a real
+# "not found" counts as "no"; a network error raises instead of being taken for one.
+_EXISTS: dict = {"movie": {}, "tv": {}}
+_EXISTS_STATE = {"loaded": False, "dirty": False}
+_EXISTS_TTL = 60 * 86400
+
+
+def _exists_path() -> Path:
+    return TOOLS / "tmdb_id_exists.json"
+
+
+def _load_exists() -> None:
+    if _EXISTS_STATE["loaded"]:
+        return
+    _EXISTS_STATE["loaded"] = True
+    now = time.time()
+    data = load_json(_exists_path())
+    for kind in ("movie", "tv"):
+        for tid, v in (data.get(kind) or {}).items():
+            if isinstance(v, list) and len(v) == 2 and now - float(v[1]) < _EXISTS_TTL:
+                _EXISTS[kind][tid] = (bool(v[0]), float(v[1]))
+
+
+def save_exists_cache() -> None:
+    if not _EXISTS_STATE["dirty"]:
+        return
+    _EXISTS_STATE["dirty"] = False
+    save_json(_exists_path(), {k: {t: [v[0], v[1]] for t, v in d.items()} for k, d in _EXISTS.items()})
+
+
+def _id_exists(kind: str, tid: str) -> bool:
+    tid = str(tid or "").strip()
+    if not tid.isdigit():
+        return False
+    _load_exists()
+    hit = _EXISTS[kind].get(tid)
+    if hit is not None:
+        return hit[0]
+    data = api_get(f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}&language=zh-CN")
+    if isinstance(data, dict) and not data.get("_error") and data.get("id") is not None:
+        ok = True
+    elif isinstance(data, dict) and data.get("_error") == "HTTP 404":
+        ok = False
+    else:
+        raise RuntimeError(f"cannot tell whether {kind} {tid} exists: {(data or {}).get('_error')}")
+    _EXISTS[kind][tid] = (ok, time.time())
+    _EXISTS_STATE["dirty"] = True
+    return ok
 
 
 def tmdb_tv_exists(tid: str) -> bool:
     """True if id resolves on TV endpoint."""
-    tid = str(tid or "").strip()
-    if not tid.isdigit():
-        return False
-    if tid in _TMDB_TV_EXISTS_CACHE:
-        return _TMDB_TV_EXISTS_CACHE[tid]
-    ok = False
-    try:
-        data = api_get(
-            f"https://api.themoviedb.org/3/tv/{tid}?api_key={API_KEY}&language=zh-CN"
-        )
-        ok = isinstance(data, dict) and not data.get("_error") and data.get("id") is not None
-    except Exception:
-        ok = False
-    _TMDB_TV_EXISTS_CACHE[tid] = ok
-    return ok
+    return _id_exists("tv", tid)
 
 
 def tmdb_movie_exists(tid: str) -> bool:
-    tid = str(tid or "").strip()
-    if not tid.isdigit():
-        return False
-    if tid in _TMDB_MOVIE_EXISTS_CACHE:
-        return _TMDB_MOVIE_EXISTS_CACHE[tid]
-    ok = False
-    try:
-        data = api_get(
-            f"https://api.themoviedb.org/3/movie/{tid}?api_key={API_KEY}&language=zh-CN"
-        )
-        ok = isinstance(data, dict) and not data.get("_error") and data.get("id") is not None
-    except Exception:
-        ok = False
-    _TMDB_MOVIE_EXISTS_CACHE[tid] = ok
-    return ok
+    return _id_exists("movie", tid)
 
 
 def _title_tokens(s: str) -> set[str]:
@@ -598,11 +620,11 @@ _PACE_LOCK = threading.Lock()
 def _pace_requests() -> None:
     """Sliding window, safe to call from several threads.
 
-    TMDB allows roughly 50 requests/s; stay at 30/s. HTTP 429 is still waited out
+    TMDB allows roughly 50 requests/s; stay at 40/s. HTTP 429 is still waited out
     in api_get.
     """
     window = 1.0
-    limit = 30
+    limit = 40
     while True:
         with _PACE_LOCK:
             now = time.monotonic()
@@ -616,7 +638,10 @@ def _pace_requests() -> None:
 
 
 # Worker threads for network-bound steps (search, detail fetch, artwork).
-WORKERS = max(1, int(os.environ.get("TMDB_WORKERS") or 8))
+try:
+    WORKERS = max(1, int(os.environ.get("TMDB_WORKERS") or 8))
+except ValueError:
+    WORKERS = 8
 
 
 def _pmap(fn, items):
@@ -628,6 +653,86 @@ def _pmap(fn, items):
         return list(ex.map(fn, items))
 
 
+# HTTP with connection reuse. urllib opens a new TLS connection (and rebuilds the CA
+# store) for every request, which was most of the time of a scan. Each worker thread
+# keeps one connection per host; an HTTP proxy from the environment is tunnelled
+# through. Anything unusual (authenticated proxy, ...) falls back to urllib.
+_SSL_CTX: list = []
+_HTTP_TLS = threading.local()
+_FALLBACK_OPENER: list = []
+
+
+def _ssl_context() -> ssl.SSLContext:
+    if not _SSL_CTX:
+        _SSL_CTX.append(ssl.create_default_context())
+    return _SSL_CTX[0]
+
+
+def _new_connection(host: str):
+    """A connection object for host, or None when urllib has to be used."""
+    try:
+        proxy = urllib.request.getproxies().get("https") or urllib.request.getproxies().get("http")
+        if proxy and urllib.request.proxy_bypass(host):
+            proxy = None
+        if not proxy:
+            return http.client.HTTPSConnection(host, timeout=60, context=_ssl_context())
+        pr = urllib.parse.urlparse(proxy if "://" in proxy else "http://" + proxy)
+        if pr.scheme != "http" or pr.username or not pr.hostname:
+            return None
+        c = http.client.HTTPSConnection(pr.hostname, pr.port or 80, timeout=60, context=_ssl_context())
+        c.set_tunnel(host, 443)
+        return c
+    except Exception:
+        return None
+
+
+def _http_get(url: str, timeout: float = 30.0) -> bytes:
+    """GET url and return the body. HTTP errors raise urllib.error.HTTPError, as urlopen did."""
+    pu = urllib.parse.urlparse(url)
+    host = pu.netloc
+    path = pu.path + ("?" + pu.query if pu.query else "")
+    conns = getattr(_HTTP_TLS, "conns", None)
+    if conns is None:
+        conns = _HTTP_TLS.conns = {}
+    headers = {"User-Agent": UA}
+    for attempt in (1, 2):
+        c = conns.get(host)
+        if c is None and host not in getattr(_HTTP_TLS, "no_pool", set()):
+            c = _new_connection(host)
+            if c is None:
+                _HTTP_TLS.no_pool = getattr(_HTTP_TLS, "no_pool", set()) | {host}
+            else:
+                conns[host] = c
+        if c is None:
+            if not _FALLBACK_OPENER:
+                _FALLBACK_OPENER.append(urllib.request.build_opener(urllib.request.HTTPSHandler(context=_ssl_context())))
+            req = urllib.request.Request(url, headers=headers)
+            with _FALLBACK_OPENER[0].open(req, timeout=timeout) as r:
+                return r.read()
+        try:
+            c.timeout = timeout
+            c.request("GET", path, headers=headers)
+            r = c.getresponse()
+            body = r.read()
+            if r.will_close:
+                conns.pop(host, None)
+                c.close()
+        except Exception:
+            # A kept-alive connection the server has closed: retry once on a new one.
+            conns.pop(host, None)
+            try:
+                c.close()
+            except Exception:
+                pass
+            if attempt == 2:
+                raise
+            continue
+        if r.status >= 400:
+            raise urllib.error.HTTPError(url, r.status, r.reason, r.headers, None)
+        return body
+    raise RuntimeError("unreachable")
+
+
 def api_get(url: str, retries: int = 4):
     cached = _URL_CACHE.get(url)
     if isinstance(cached, dict):
@@ -637,11 +742,7 @@ def api_get(url: str, retries: int = 4):
     while attempt < retries:
         _pace_requests()
         try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": UA, "Connection": "keep-alive"}
-            )
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = json.loads(r.read().decode("utf-8", "ignore"))
+            data = json.loads(_http_get(url, timeout=30).decode("utf-8", "ignore"))
             if not isinstance(data, dict):
                 data = {"_error": "bad_response", "raw": data}
             _URL_CACHE[url] = data
@@ -697,9 +798,15 @@ def load_json(path: Path) -> dict:
 
 
 def save_json(path: Path, data: dict) -> None:
+    """Write via a temp file and rename, so a crash never leaves a half-written cache.
+    The big caches are written compact; logs stay readable."""
     try:
         TOOLS.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        big = path.name in ("tmdb_movie_title_cache.json", "tmdb_search_cache.json", "tmdb_id_exists.json")
+        text = json.dumps(data, ensure_ascii=False, indent=None if big else 2, separators=(",", ":") if big else None)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(str(tmp), str(path))
     except Exception as e:
         print(f"  warn: save failed {path.name}: {e}", flush=True)
 
@@ -2273,12 +2380,24 @@ def _search_tmdb_impl(query: str, year: str | None, search_cache: dict, prefer_t
         # and a big library then tripped TMDB's rate limit.
         movie_scored: list = []
         tv_scored: list = []
+        # A folder that says what it is (S01E01 files, 电视剧, 电影) is searched on that
+        # side first; the other side is only asked when that gives no exact title.
+        _order = ("tv", "movie") if prefer_kind == "tv" else ("movie", "tv")
+        _lists = {"movie": movie_scored, "tv": tv_scored}
+
+        def _search_side(side_year):
+            for k in _order:
+                if k != _order[0] and prefer_kind and _scored_has_exact(_lists[_order[0]], q):
+                    break
+                if side_year:
+                    _lists[k][:] = _search_tmdb_one_kind(k, q, side_year)
+                else:
+                    _merge_scored(_lists[k], _search_tmdb_one_kind(k, q, None))
+
         if has_year:
-            movie_scored = _search_tmdb_one_kind("movie", q, year)
-            tv_scored = _search_tmdb_one_kind("tv", q, year)
+            _search_side(year)
         if not _scored_has_exact(movie_scored, q) and not _scored_has_exact(tv_scored, q):
-            _merge_scored(movie_scored, _search_tmdb_one_kind("movie", q, None))
-            _merge_scored(tv_scored, _search_tmdb_one_kind("tv", q, None))
+            _search_side(None)
         if has_year and not _scored_has_exact(movie_scored, q) and not _scored_has_exact(tv_scored, q):
             # Filename year off by one (The Captain 2017 vs 2018).
             try:
@@ -2530,12 +2649,27 @@ DISC_DIR_NAMES = {
 }
 
 
+def _entries(folder: Path, strict: bool = False) -> list:
+    """[(name, is_dir, is_file)] in one directory read. os.scandir gets the type with the
+    listing, where Path.iterdir()+is_dir() costs one extra call per entry (slow on a
+    network share)."""
+    out = []
+    try:
+        with os.scandir(str(folder)) as it:
+            for e in it:
+                try:
+                    out.append((e.name, e.is_dir(), e.is_file()))
+                except OSError:
+                    pass
+    except Exception:
+        if strict:
+            raise
+    return out
+
+
 def is_disc_structure(folder: Path) -> bool:
     """Blu-ray / DVD folder tree — treat outer folder as one leaf; never dig in."""
-    try:
-        names = {c.name.lower() for c in folder.iterdir() if c.is_dir() or c.is_file()}
-    except Exception:
-        return False
+    names = {n.lower() for n, isd, isf in _entries(folder) if isd or isf}
     if "bdmv" in names:
         return True
     if "video_ts" in names:
@@ -2546,49 +2680,35 @@ def is_disc_structure(folder: Path) -> bool:
 
 
 def has_video(folder: Path) -> bool:
-    try:
-        for c in folder.iterdir():
-            if c.is_file() and c.suffix.lower() in VIDEO:
-                return True
-            if c.is_dir() and c.name.lower() in ("bdmv", "video_ts"):
-                return True
-    except Exception:
-        return False
+    for n, isd, isf in _entries(folder):
+        if isf and Path(n).suffix.lower() in VIDEO:
+            return True
+        if isd and n.lower() in ("bdmv", "video_ts"):
+            return True
     return False
 
 
 def list_videos_in_dir(folder: Path) -> list[Path]:
-    out = []
-    try:
-        for c in folder.iterdir():
-            if c.is_file() and c.suffix.lower() in VIDEO:
-                out.append(c)
-    except Exception:
-        pass
-    return out
+    return [folder / n for n, _isd, isf in _entries(folder) if isf and Path(n).suffix.lower() in VIDEO]
 
 
 def interesting_subdirs(folder: Path) -> list[Path]:
     """Non-prune, non-extras, non-BDMV subdirs."""
     out = []
-    try:
-        for x in folder.iterdir():
-            if not x.is_dir() or should_prune(x.name):
-                continue
-            if x.name.lower() in DISC_DIR_NAMES:
-                continue
-            if is_extras_dir(x.name):
-                continue
-            out.append(x)
-    except Exception:
-        pass
+    for n, isd, _isf in _entries(folder):
+        if not isd or should_prune(n):
+            continue
+        if n.lower() in DISC_DIR_NAMES:
+            continue
+        if is_extras_dir(n):
+            continue
+        out.append(folder / n)
     return out
 
 
 def find_nfo_meta(folder: Path):
-    try:
-        nfos = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".nfo" and not p.name.startswith(".")]
-    except Exception:
+    nfos = [folder / n for n, _isd, isf in _entries(folder) if isf and n.lower().endswith(".nfo") and not n.startswith(".")]
+    if not nfos:
         return {}
     nfos.sort(key=lambda p: (0 if p.name.lower() == "movie.nfo" else 1, p.name.lower()))
     for nfo in nfos[:6]:
@@ -2918,6 +3038,25 @@ def root_is_single_movie(folder: Path) -> bool:
         return False
 
 
+_SIDECAR_EXT = {".srt", ".ass", ".ssa", ".sub", ".idx", ".sup", ".vtt", ".smi", ".sbv", ".nfo", ".jpg", ".jpeg", ".png", ".tbn"}
+
+
+def sidecar_files(video: Path) -> list[Path]:
+    """Files next to a video that belong to it: Name.chs.srt, Name.nfo, Name-poster.jpg."""
+    out = []
+    stem = video.stem
+    for n, _isd, isf in _entries(video.parent):
+        if not isf or n == video.name:
+            continue
+        ext = Path(n).suffix.lower()
+        if ext not in _SIDECAR_EXT or not n.startswith(stem):
+            continue
+        rest = n[len(stem):]
+        if rest[:1] in (".", "-", "_", " "):
+            out.append(video.parent / n)
+    return out
+
+
 def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
     """Wrap loose videos only when TMDB can identify the group.
 
@@ -2935,6 +3074,8 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
         pass
     wrapped = []
     search_cache = load_json(SEARCH_CACHE_PATH)
+    meta_cache = load_json(CACHE_PATH)  # loaded once, saved once: it can be large
+    meta_cache_dirty = False
     stack = [root]
     seen = set()
     while stack:
@@ -2943,14 +3084,11 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
         if key in seen:
             continue
         seen.add(key)
-        try:
-            kids = list(d.iterdir())
-        except Exception:
-            continue
+        kids = [d / n for n, isd, _isf in _entries(d) if isd]
 
         for child in kids:
             try:
-                if not child.is_dir() or should_prune(child.name):
+                if should_prune(child.name):
                     continue
                 if is_collection_dir(child.name):
                     stack.append(child)
@@ -2995,10 +3133,10 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
                 continue
 
             # Prefer parent/folder title over disc codes like TJ_GOLDEN_ERA_ANTHOLOGY_D1
-            year = extract_year(base) or (None if is_drive_root(d) else extract_year(d.name))
+            year = extract_year(base) or (None if (is_drive_root(d) or is_root) else extract_year(d.name))
             queries = []
             sources = [base]
-            if not is_drive_root(d):
+            if not is_drive_root(d) and not is_root:
                 sources.insert(0, d.name)
             for src_name in sources:
                 if not (src_name or "").strip():
@@ -3063,11 +3201,10 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
             title_for_folder = query
             year_for_folder = year
             try:
-                cache = load_json(CACHE_PATH)
                 _cent = search_cache.get(_search_cache_key(query, year, "", folder_media_hint(d.name) or "")) or {}
                 _mk = _cent.get("media") if _cent.get("media") in ("movie", "tv") else None
-                meta = fetch_movie(str(tid), cache, kind=_mk)
-                save_json(CACHE_PATH, cache)
+                meta = fetch_movie(str(tid), meta_cache, kind=_mk)
+                meta_cache_dirty = True
                 if isinstance(meta, dict) and meta.get("ok") and meta.get("picked_title"):
                     title_for_folder = meta.get("picked_title") or title_for_folder
                     year_for_folder = meta.get("year") or year_for_folder
@@ -3091,10 +3228,13 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
                     "tmdb": str(tid),
                     "title": title_for_folder,
                 }
+                side = sidecar_files(vf)
+                if side:
+                    rec["sidecars"] = [x.name for x in side]
                 if preview:
                     rec["action"] = "would_wrap"
                     wrapped.append(rec)
-                    print(f"  计划收入文件夹: {vf.name} -> {dest_dir.name}/", flush=True)
+                    print(f"  计划收入文件夹: {vf.name} -> {dest_dir.name}/" + (f"（连同 {len(side)} 个字幕/附属文件）" if side else ""), flush=True)
                 else:
                     created = False
                     try:
@@ -3105,6 +3245,13 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
                         if Path(long_path(dest_file)).exists():
                             final_dest = dest_dir / f"{vf.stem}_moved{vf.suffix}"
                         shutil.move(long_path(vf), long_path(final_dest))
+                        for sc in side:  # subtitles / nfo that belong to the video go with it
+                            try:
+                                target = dest_dir / sc.name
+                                if not Path(long_path(target)).exists():
+                                    shutil.move(long_path(sc), long_path(target))
+                            except Exception:
+                                pass
                         rec["action"] = "wrapped"
                         rec["video"] = str(final_dest)
                         wrapped.append(rec)
@@ -3123,6 +3270,8 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
                                 pass
     try:
         save_json(SEARCH_CACHE_PATH, search_cache)
+        if meta_cache_dirty:
+            save_json(CACHE_PATH, meta_cache)
     except Exception:
         pass
     # wrap_stamp_media_kind
@@ -3178,13 +3327,13 @@ def collect_candidate_dirs(root: Path):
             continue
         seen.add(key)
         try:
-            kids = list(d.iterdir())
+            kids = [d / n for n, isd, _isf in _entries(d, strict=True) if isd]
         except Exception as e:
             print(f"  skip unreadable: {d} ({e})", flush=True)
             continue
         for child in kids:
             try:
-                if not child.is_dir() or should_prune(child.name):
+                if should_prune(child.name):
                     continue
                 # Never enter Blu-ray/DVD internal dirs as their own movies
                 if child.name.lower() in DISC_DIR_NAMES or child.name.lower() in {
@@ -3211,7 +3360,7 @@ def collect_candidate_dirs(root: Path):
                     })
                     continue
                 try:
-                    subdirs = [x for x in child.iterdir() if x.is_dir() and not should_prune(x.name)]
+                    subdirs = [child / n for n, isd, _isf in _entries(child, strict=True) if isd and not should_prune(n)]
                 except Exception:
                     subdirs = []
                 # A show folder whose subfolders are Season 01 / S02 / 第一季 ...: the show
@@ -3313,6 +3462,9 @@ def _try_unique_title_search(leaf: dict, search_cache: dict) -> bool:
         return True
     return False
 
+
+# The folder the scan started from. Its name is the library's, never a film's title.
+SCAN_ROOT: Path | None = None
 
 # Choices made in the GUI for folders the tool could not decide: {path: {"tmdb", "media"}}.
 USER_CHOICES: dict = {}
@@ -3540,7 +3692,8 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
     # "Films" would be searched too and could outrank or hijack the real title.
     has_own_queries = any(q and q.strip() for q in queries)
     parent_own = {q.strip().lower() for q in queries if q}
-    if parent_name and parent_name.lower() not in {"movies", "movie", "tv", "tvs", "电视剧", "电影", "动漫", "动画"}:
+    parent_is_root = SCAN_ROOT is not None and _path_key(leaf.get("parent") or folder.parent) == _path_key(SCAN_ROOT)
+    if parent_name and not parent_is_root and parent_name.lower() not in {"movies", "movie", "tv", "tvs", "电视剧", "电影", "动漫", "动画"}:
         if not [q for q in queries if q and q.strip()] or looks_like_disc_folder(leaf.get("name") or ""):
             _add_queries(parent_name, parent_queries)
             if not year:
@@ -3691,9 +3844,7 @@ def _download_bytes(url: str, dest: Path, min_size: int = 500) -> str:
     last_err = ""
     for attempt in range(1, 5):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Connection": "keep-alive"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                data = r.read()
+            data = _http_get(url, timeout=60)
             if not data or len(data) < min_size:
                 return "too_small"
             tmp.write_bytes(data)
@@ -3927,13 +4078,7 @@ def build_nfo_xml(meta: dict, tid: str, root: str = "movie") -> str:
 
 def folder_has_nfo(folder: Path) -> bool:
     """True if folder already has any .nfo (Emby or prior scrape)."""
-    try:
-        for p in folder.iterdir():
-            if p.is_file() and p.suffix.lower() == ".nfo" and not p.name.startswith("."):
-                return True
-    except Exception:
-        pass
-    return False
+    return any(isf and n.lower().endswith(".nfo") and not n.startswith(".") for n, _isd, isf in _entries(folder))
 
 
 
@@ -4527,7 +4672,10 @@ def tmdb_id_both_kinds(tid: str) -> bool:
     tid = str(tid or "").strip()
     if not tid.isdigit():
         return False
-    return bool(tmdb_tv_exists(tid) and tmdb_movie_exists(tid))
+    try:
+        return bool(tmdb_tv_exists(tid) and tmdb_movie_exists(tid))
+    except Exception:
+        return True  # cannot tell (network): treat as unclear so the folder is not renamed
 
 
 def _title_scores_for_id(tid: str, folder_name: str) -> tuple[int, int, str, str]:
@@ -4956,6 +5104,8 @@ def main():
         root = root.resolve()
     except Exception:
         pass
+    global SCAN_ROOT
+    SCAN_ROOT = root
 
     # Reset rename-success log each run so UI won't show stale "改名成功" from older sessions
     try:
@@ -5048,6 +5198,7 @@ def main():
                     L["reason"] = L.get("id_from") or "unresolved"
                 unresolved.append(L)
     resolved = _pmap(lambda u: resolve_leaf_id(u, search_cache), untagged)
+    save_exists_cache()
     for u, ok in zip(untagged, resolved):
         if ok:
             leaves.append(u)
@@ -5350,6 +5501,7 @@ def main():
         "preview": preview,
         "media": MEDIA_KIND,
     }
+    save_exists_cache()
     log_path = TOOLS / "tmdb_format_rename_last.json"
     log_path.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"详细日志文件: {log_path}", flush=True)
