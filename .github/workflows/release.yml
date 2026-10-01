@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v1.14"
+        description: "Release tag, e.g. v1.15"
         required: true
-        default: "v1.14"
+        default: "v1.15"
 
 permissions:
   contents: write
@@ -37,15 +37,12 @@ jobs:
           $notes = @'
           Windows 可执行版。不需要安装 Python，也不需要旁边的 .py。
 
-          这一版主要修剧集：
+          这一版修合并季在网络盘 / 网盘上失败的问题：
 
-          - 修复：同一部剧的各季文件夹被当成「重复影片」（v1.11–v1.13 的自动模式下合并季没有生效）。现在会并进「剧名/Season NN」；分季文件夹永远不会再被当成重复电影
-          - 以后新加的一季（如 老友记第九季）会并进已经刮削好的剧目录；同一季有两份时整组不动，写明原因
-          - 剧集名字里的年份是那一季的年份（Friends.S07.2000），带年份搜不到时自动去掉年份再搜
-          - 中英双语文件夹名（切尔诺贝利 Chernobyl）只要一半和 TMDB 标题一致就算匹配
-          - 收进 Season 文件夹时，海报、tvshow.nfo 等剧集级文件留在剧目录顶层
-          - 修复：重复运行时 tmdb.html 被记成「新建」，导致「撤销上次改名」撤错了那一次
-          - 只保留自动模式（电影和剧集一起识别），删掉单独的电影/剧集模式及其代码
-          - 「重复影片」提示写明「未改动」：程序从不删除任何文件
+          - 修复：合并季失败后重试时误把季文件夹改名成已存在的剧目录，报 WinError 183 并盖住了真正的错误。现在重试会重做同一个合并，并显示第一次的真实错误
+          - 合并一季时整个季文件夹只移动一次（变成 剧名\Season NN），操作少一半多，网络盘上更稳；遇到短暂的「找不到路径 / 文件被占用」会稍等重试；系统改名不支持时改用 Windows 的 move 再试
+          - 移动失败时不会留下空的剧目录，季文件夹原样不动
+          - Specials / 特别篇 / 特典 / 番外 文件夹对应 TMDB 第 0 季，放进剧目录下的 Specials，不再让整部剧卡在「看不出是第几季」
+          - 继承 v1.14：分季文件夹合并到 Season NN、新加的一季并进已有剧目录、只保留自动模式
           '@
           gh release create "${{ inputs.tag }}" dist\TMDB-scrape-rename.exe --title "${{ inputs.tag }}" --notes "$notes" --target "${{ github.sha }}"

@@ -4500,27 +4500,36 @@ def undo_last_run() -> int:
 
 
 def _rename_one(src: Path, dest: Path) -> None:
-    """Rename folder; fall back to cmd ren on WinError 50 (some cloud mounts)."""
-    try:
-        src.rename(dest)
-        _log_op("rename", src=str(src), dst=str(dest))
-        return
-    except OSError as e:
-        if getattr(e, "winerror", None) != 50 and "not supported" not in str(e).lower():
+    """Rename / move src to dest (never over an existing dest).
+
+    Network and cloud mounts sometimes fail for a moment right after a folder was created or
+    renamed (path not found, file in use): wait and try again. Some cloud mounts refuse the
+    rename call itself (WinError 50): use cmd's ren / move instead."""
+    last = None
+    for attempt in range(4):
+        try:
+            src.rename(dest)
+            _log_op("rename", src=str(src), dst=str(dest))
+            return
+        except OSError as e:
+            last = e
+            code = getattr(e, "winerror", None)
+            if code == 50 or "not supported" in str(e).lower():
+                break
+            if code in (2, 3, 5, 32) and attempt < 3 and src.exists() and not dest.exists():
+                time.sleep(0.5 * (attempt + 1))
+                continue
             raise
     import subprocess
-    if src.parent != dest.parent:
-        raise OSError(f"cross-dir rename not supported via cmd: {src} -> {dest}")
-    r = subprocess.run(
-        ["cmd", "/c", "ren", str(src), dest.name],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-    )
-    if r.returncode != 0 or not dest.exists():
-        err = (r.stderr or r.stdout or "").strip() or f"cmd ren failed code={r.returncode}"
-        raise OSError(err)
+    if src.parent == dest.parent:
+        cmd = ["cmd", "/c", "ren", str(src), dest.name]
+    else:
+        cmd = ["cmd", "/c", "move", str(src), str(dest)]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore",
+                       stdin=subprocess.DEVNULL)
+    if r.returncode != 0 or not dest.exists() or src.exists():
+        err = (r.stderr or r.stdout or "").strip() or f"code={r.returncode}"
+        raise OSError(f"这个盘不支持此移动（{last}；cmd: {err}）: {src} -> {dest}")
     _log_op("rename", src=str(src), dst=str(dest))
 
 
@@ -4604,10 +4613,13 @@ def apply_renames(plan):
                 if not src.exists():
                     fail.append({**rec, "error": "source_missing"})
                 else:
-                    if str(src) != str(dest):
-                        _rename_one(src, dest)
-                    if rec.get("season_wrap") is not None:
-                        wrap_into_season(dest, rec["season_wrap"])
+                    if rec.get("season_wrap") is not None and str(src) != str(dest) and not dest.exists():
+                        move_into_season(src, dest, rec["season_wrap"])
+                    else:
+                        if str(src) != str(dest):
+                            _rename_one(src, dest)
+                        if rec.get("season_wrap") is not None:
+                            wrap_into_season(dest, rec["season_wrap"])
                     if rec.get("version_label"):
                         apply_version_names(dest, rec.get("version_base") or dest.name,
                                             rec["version_label"], rec.get("version_videos") or [])
@@ -4622,15 +4634,33 @@ def apply_renames(plan):
         src = Path(rec["path"])
         dest = Path(rec["dest"])
         action = (rec.get("action") or "rename").strip()
+        first = rec.get("error") or ""
         try:
-            time.sleep(0.12)
-            if action == "merge_into":
+            time.sleep(0.5)
+            if action in ("merge_into", "merge_season", "merge_version"):
+                # Retry the same move; never rename the folder over the merged one.
                 if not src.exists():
-                    ok.append({**rec, "final": str(dest), "note": "merge_src_missing"})
+                    ok.append({**rec, "final": str(dest), "note": "merged_retry"})
                     continue
-                merge_folder_into(src, dest)
-                _maybe_flatten(rec, dest)
+                if action == "merge_season" and rec.get("season_no") is not None:
+                    move_into_season(src, dest, rec["season_no"])
+                else:
+                    if action == "merge_version":
+                        apply_version_names(src, rec.get("version_base") or dest.name,
+                                            rec.get("version_label") or "", rec.get("version_videos") or [])
+                    merge_folder_into(src, dest)
+                    _maybe_flatten(rec, dest)
                 ok.append({**rec, "final": str(dest), "note": "merged_retry"})
+                continue
+            if rec.get("season_wrap") is not None:
+                if src.exists() and str(src) != str(dest) and not dest.exists():
+                    move_into_season(src, dest, rec["season_wrap"])
+                elif dest.exists():
+                    wrap_into_season(dest, rec["season_wrap"])
+                else:
+                    still.append(rec)
+                    continue
+                ok.append({**rec, "final": str(dest), "note": "retry_ok"})
                 continue
             if dest.exists() and not src.exists():
                 ok.append({**rec, "final": str(dest), "note": "already_dest"})
@@ -4642,7 +4672,8 @@ def apply_renames(plan):
             _maybe_flatten(rec, dest)
             ok.append({**rec, "final": str(dest), "note": "retry_ok"})
         except Exception as e:
-            still.append({**rec, "error": str(e)})
+            again = str(e)
+            still.append({**rec, "error": first if (not again or again == first) else f"{first}（重试：{again}）"})
     return ok, still
 
 
@@ -5097,7 +5128,18 @@ def season_number_from_name(name: str) -> int | None:
 
 
 def season_folder_name(n: int) -> str:
-    return f"Season {n:02d}"
+    return "Specials" if n == 0 else f"Season {n:02d}"
+
+
+_SPECIALS_RE = re.compile(r"(?i)(?<![a-z])specials?(?![a-z])|特别篇|特典|番外")
+
+
+def season_or_specials(name: str):
+    """Season number of a folder name; 0 for a specials folder; None when unknown."""
+    n = season_number_from_name(name)
+    if n is None and _SPECIALS_RE.search(name or ""):
+        return 0
+    return n
 
 
 # Scraper files that describe the whole show; they stay at the top of the show folder.
@@ -5114,24 +5156,44 @@ def _ensure_dir(d: Path) -> None:
 
 
 def move_into_season(src: Path, dest: Path, season: int) -> None:
-    """Move a season folder's content into dest/Season NN, then drop the empty src.
-    Show-level scraper files go to the top of dest when it has none yet."""
+    """Make src (one season's folder) dest/Season NN, then drop the empty src.
+
+    Usually a single folder move. If Season NN is already there, the content is merged into
+    it file by file. Show-level scraper files go to the top of dest when it has none yet."""
     sd = dest / season_folder_name(season)
-    _ensure_dir(sd)
-    for child in list(src.iterdir()):
-        if child.is_file() and child.name.lower() in SHOW_LEVEL_FILES and not (dest / child.name).exists():
+    made_dest = not dest.exists()
+    _ensure_dir(dest)
+    if not sd.exists():
+        try:
+            _rename_one(src, sd)
+        except OSError:
+            if made_dest:
+                try:
+                    dest.rmdir()
+                    _log_op("rmdir", path=str(dest))
+                except OSError:
+                    pass
+            raise
+        moved_from = sd
+    else:
+        for child in list(src.iterdir()):
+            _rename_one(child, _unique_child_path(sd, child.name))
+        try:
+            if not any(src.iterdir()):
+                src.rmdir()
+                _log_op("rmdir", path=str(src))
+        except Exception:
+            pass
+        moved_from = sd
+    for child in list(moved_from.iterdir()):
+        name = child.name.lower()
+        if not child.is_file() or name not in SHOW_LEVEL_FILES:
+            continue
+        if not (dest / child.name).exists():
             _rename_one(child, dest / child.name)
-        elif child.is_file() and child.name.lower() == "tvshow.nfo":
+        elif name == "tvshow.nfo":
             # The show already has one; inside a season folder it would only confuse Emby.
             _rename_one(child, _unique_child_path(sd, "tvshow.nfo.old"))
-        else:
-            _rename_one(child, _unique_child_path(sd, child.name))
-    try:
-        if not any(src.iterdir()):
-            src.rmdir()
-            _log_op("rmdir", path=str(src))
-    except Exception:
-        pass
 
 
 def wrap_into_season(folder: Path, season: int) -> None:
@@ -5165,11 +5227,11 @@ def _season_layout(r: dict):
     subs = set()
     for n, isd, _isf in _entries(p):
         if isd and is_season_dir_name(n):
-            k = season_number_from_name(n)
+            k = season_or_specials(n)
             subs.add(k if k is not None else n.lower())
     if subs:
         return "show", subs
-    n = season_number_from_name(r.get("name") or "")
+    n = season_or_specials(r.get("name") or "")
     if n is None:
         loc = [k for k in local_season_counts(p) if k >= 1]
         if len(loc) == 1:
@@ -5206,7 +5268,7 @@ def resolve_season_group(prim: dict, others: list) -> tuple[list, list]:
         if v is None:
             why = "看不出是第几季"
         elif v in claimed:
-            why = f"第{v}季有两份"
+            why = "特别篇有两份" if v == 0 else f"第{v}季有两份"
         else:
             claimed.add(v)
     movers = [r for r in group if not r.get("existing")]
