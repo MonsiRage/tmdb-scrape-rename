@@ -4764,37 +4764,16 @@ def picked_title_from_cache(meta: dict):
     return meta.get("picked_title"), meta.get("year"), meta.get("picked_lang")
 
 
-def normalize_root_arg(raw: str) -> tuple[Path, list[str]]:
-    """Fix Windows bat quoting of drive roots (trailing backslash + quote).
-
-    Bats should pass "%CD%." ; also recover mangled drive-root + --preview.
-    """
-    extra: list[str] = []
-    s = (raw or "").strip().strip('"')
-    for flag in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new"):
-        if flag in s:
-            extra.append(flag)
-            idx = s.find(flag)
-            if idx >= 0:
-                s = s[:idx]
-            while s and s[-1] in ' "\\':
-                s = s[:-1]
-    s = s.strip().strip('"')
-    while s.endswith("\\") or s.endswith("/"):
-        # keep drive root as X:\  — strip only extras after we handle drive
-        if len(s) == 3 and s[1] == ":" and s[2] in "\\/":
-            break
-        if len(s) <= 3 and len(s) >= 2 and s[1] == ":":
-            break
-        s = s[:-1]
-    if len(s) == 2 and s[1] == ":":
-        s = s + "\\"
-    # "%CD%." -> E:\.
+def normalize_root_arg(raw: str) -> Path:
+    """Clean a root given on the command line: stray quotes, 'E:' -> 'E:\\', 'E:\\.' -> 'E:\\'."""
+    s = (raw or "").strip().strip('"').strip()
     if s.endswith("\\.") or s.endswith("/."):
         s = s[:-1]
-    elif len(s) >= 3 and s[-1] == "." and s[-2] in "\\/":
+    while len(s) > 3 and s[-1] in "\\/":
         s = s[:-1]
-    return Path(s), extra
+    if len(s) == 2 and s[1] == ":":
+        s += "\\"
+    return Path(s)
 
 
 
@@ -5721,17 +5700,7 @@ def main():
     if not args:
         root = Path(os.environ.get("TMDB_RENAME_ROOT") or os.getcwd())
     else:
-        root, glued = normalize_root_arg(args[0])
-        if "--preview" in glued or "-n" in glued:
-            preview = True
-        if "--no-poster" in glued:
-            no_poster = True
-        if "--no-nfo" in glued:
-            no_nfo = True
-        if "--preview-nfo" in glued:
-            preview_nfo = True
-        if "--only-new" in glued:
-            only_new = True
+        root = normalize_root_arg(args[0])
     try:
         root = root.resolve()
     except Exception:
@@ -6160,29 +6129,12 @@ def main():
 
     # Stamp media for GUI: classify each TMDB id (cached; title-match on movie/tv id collisions).
     def _quick_stamp(rows):
-        out = []
-        for x in rows:
-            it = dict(x)
-            out.append(stamp_item_media(it))
-        return out
+        try:
+            return [stamp_item_media(dict(x)) for x in rows]
+        except Exception:
+            return rows
 
-    try:
-        leaves = _quick_stamp(leaves)
-    except Exception:
-        pass
-    try:
-        skip = _quick_stamp(skip)
-    except Exception:
-        pass
-    try:
-        plan = _quick_stamp(plan)
-    except Exception:
-        pass
-    try:
-        unresolved = _quick_stamp(unresolved)
-    except Exception:
-        pass
-
+    leaves, skip, plan, unresolved = (_quick_stamp(x) for x in (leaves, skip, plan, unresolved))
 
     log = {
         "root": str(root),
@@ -6204,8 +6156,6 @@ def main():
     save_exists_cache()
     if not preview:
         save_history(root)
-        if CHANGE_LOG:
-            print(f"改动已记录，可以用「撤销上次改名」还原（{len(CHANGE_LOG)} 步）。", flush=True)
     log_path = TOOLS / "tmdb_format_rename_last.json"
     log_path.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"详细日志文件: {log_path}", flush=True)
@@ -6333,6 +6283,8 @@ def main():
     print("  · 已有跳过 = 封面等文件已存在，不会重复下载", flush=True)
     if not preview:
         save_history(root)
+        if CHANGE_LOG:
+            print(f"改动已记录，可以用「撤销上次改名」还原（{len(CHANGE_LOG)} 步）。", flush=True)
     return 0 if not fail else 1
 
 

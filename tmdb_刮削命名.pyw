@@ -828,62 +828,18 @@ class App(tk.Tk):
             rename_fail_list = []
 
         already_ok = [s for s in skip if s.get("reason") == "already_ok"]
-        # 重复（电影+剧集都命中 / 多候选）vs 真正刮削不到
-        dupe_reasons = {
-            "ambiguous_movie_and_tv",
-            "ambiguous_no_year",
-            "ambiguous",
-            "multiple_matches",
-        }
-        fail_reasons = {
-            "no_tmdb_id",
-            "no_results",
-            "search_error",
-            "empty_query",
-            "no_usable_title",
-            "skip_no_tmdb",
-            "rename_failed",
-            "dest_exists",
-            "not_found",
-        }
         unmatched = [s for s in skip if s.get("reason") != "already_ok"]
-        dupe_skips = [s for s in unmatched if (s.get("reason") or "") in dupe_reasons]
-        problem_skips = [
-            s for s in unmatched
-            if (s.get("reason") or "") in fail_reasons
-            or (not s.get("tmdb") and (s.get("reason") or "") not in dupe_reasons)
-        ]
-        # leftovers that are neither dupe nor clear fail → treat as fail (scrape miss)
-        known = dupe_reasons | fail_reasons | {"already_ok"}
-        for s in unmatched:
-            r = s.get("reason") or ""
-            if r in known:
-                continue
-            if s in dupe_skips or s in problem_skips:
-                continue
-            problem_skips.append(s)
 
         leaf_count = int(data.get("leaf_count") or len(leaves) or len(already_ok))
         plan_count = int(data.get("plan_count") or len(plan))
         wrap_count = int(data.get("wrapped_count") or len(wrapped))
         skip_count = int(data.get("skip_count") or len(skip))
         ok_count = len(ok_list)
-        
 
         mode = "仅预览" if preview else "正式刮削"
         tip = ""
         if preview and self._last_was_preview:
             tip = "  → 可点右上角「确认并正式刮削」"
-        self.summary.configure(
-            text=(
-                f"【{media_zh}】{mode}完成 · 已识别 {leaf_count} · 更改(待) {plan_count} · "
-                f"已正确命名 {len(already_ok)} · 跳过已刮削 {int(data.get('skipped_done_count') or 0)} · "
-                f"需要确认 {len(unmatched)} · "
-                f"散落(入更改) {wrap_count} · 改名成功 {ok_count}"
-                + tip
-            )
-        )
-
         # Keep runner media in sync with result JSON (avoid mixing movie/tv reads)
         self._media = media
         self.title(f"TMDB 刮削命名 — 【{media_zh}】结果")
@@ -952,7 +908,6 @@ class App(tk.Tk):
                         f"→ {p.get('target') or p.get('dest') or ''}",
                     )
                 )
-            tab_note = "更改"
         else:
             # 正式刮削后优先显示本次已更改；若无改名结果则仍显示计划（例如无需改名）
             src_rows = ok_list if ok_list else plan
@@ -970,7 +925,6 @@ class App(tk.Tk):
                         or "",
                     )
                 )
-            tab_note = "更改"
         # 散落整理并入「更改」：建夹/改标题与文件夹改名同属整理
         for w in wrapped:
             action = (w.get("action") or "").strip()
@@ -992,7 +946,7 @@ class App(tk.Tk):
             change_rows.append((type_zh, name, status, detail))
         # 散落整理也仍显示「更改」，不把状态写进标签名
         self._fill_tree("changes", change_rows)
-        self._set_tab_title("changes", tab_note, len(change_rows))
+        self._set_tab_title("changes", "更改", len(change_rows))
 
         def _um_row(item, default_reason=""):
             reason = item.get("reason") or item.get("id_from") or default_reason or "unmatched"
