@@ -44,7 +44,7 @@ pythonw tmdb_刮削命名.pyw
 python tmdb_format_rename.py "D:\影片"              # 正式执行
 python tmdb_format_rename.py "D:\影片" --preview    # 仅预览
 python tmdb_format_rename.py "D:\影片" --no-poster --no-nfo
-python tmdb_format_rename.py "D:\影片" --media=tv   # 按剧集处理（也可 --media=movie / auto）
+python tmdb_format_rename.py --undo                  # 撤销上一次正式更改
 ```
 
 ## 环境要求

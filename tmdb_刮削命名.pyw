@@ -166,14 +166,14 @@ def zh_reason(code: str) -> str:
 
 
 
-def guess_lib_kind(item: dict, run_media: str = "movie") -> str:
+def guess_lib_kind(item: dict) -> str:
     """Classify as movie/tv for result tabs.
 
     Do NOT trust user folder names like 电影/电视剧 — those are manual and may be wrong.
-    Prefer per-item media stamped by the scraper; else TMDB id kind; else this run mode.
+    Prefer per-item media stamped by the scraper; else TMDB id kind; else movie.
     """
     if not isinstance(item, dict):
-        return "tv" if run_media == "tv" else "movie"
+        return "movie"
     for key in ("media", "media_kind", "kind_media", "media_hint"):
         v = (item.get(key) or "").strip().lower()
         if v in ("tv", "show", "series", "剧集"):
@@ -190,7 +190,7 @@ def guess_lib_kind(item: dict, run_media: str = "movie") -> str:
         return "tv"
     if item.get("is_movie") is True:
         return "movie"
-    # Classify by TMDB id when wrap/plan rows omit media (auto mode).
+    # Classify by TMDB id when wrap/plan rows omit media.
     tid = str(item.get("tmdb") or item.get("id") or "").strip()
     if tid.isdigit():
         try:
@@ -201,7 +201,7 @@ def guess_lib_kind(item: dict, run_media: str = "movie") -> str:
                 return k
         except Exception:
             pass
-    return "tv" if run_media == "tv" else "movie"
+    return "movie"
 
 
 
@@ -216,7 +216,6 @@ class App(tk.Tk):
         self.proc = None
         self._scan_root: Path | None = None
         self._last_was_preview = False
-        self._media = "auto"
         self._only_new = True
         self._build_chooser()
         self._stop_flag = False
@@ -236,7 +235,7 @@ class App(tk.Tk):
         )
         ttk.Label(
             top,
-            text="① 选扫描目录  →  ② 预览或确认刮削（电影+剧集双搜，冲突进失败栏）",
+            text="① 选扫描目录  →  ② 预览或确认刮削（电影和剧集一起识别，拿不准的进「需要确认」）",
             font=("Microsoft YaHei UI", 10),
         ).pack(anchor="w", pady=(0, 12))
 
@@ -362,7 +361,6 @@ class App(tk.Tk):
                 "请填写 TMDB API Key。\n它会保存在 %AppData%\\Roaming\\TMDB刮削命名\\tmdb_api_key.txt。",
             )
             return
-        media = "auto"
         self._only_new = bool(self.only_new_var.get()) if getattr(self, "only_new_var", None) is not None else bool(getattr(self, "_only_new", True))
         only_line = "只处理新文件夹，已有 [tmdbid=] 的会跳过。\n" if self._only_new else ""
         # 仅预览：直接开跑，不弹确认框；正式刮削才确认
@@ -370,7 +368,7 @@ class App(tk.Tk):
             ok = messagebox.askyesno(
                 "确认刮削",
                 (
-                    f"媒体: 自动（电影+剧集双搜）\n模式: 正式更改\n目录: {root}\n\n"
+                    f"模式: 正式更改\n目录: {root}\n\n"
                     f"{only_line}"
                     "两边都命中的会进失败栏，不改名。确定开始？"
                 ),
@@ -378,8 +376,7 @@ class App(tk.Tk):
             if not ok:
                 return
 
-        self._media = media
-        self._show_runner(root, preview, media)
+        self._show_runner(root, preview)
 
     def _make_scrollable_tree(self, parent: ttk.Frame) -> ttk.Treeview:
         wrap = ttk.Frame(parent)
@@ -464,22 +461,20 @@ class App(tk.Tk):
         except Exception:
             pass
 
-    def _show_runner(self, root: Path, preview: bool, media: str, cli_override: list | None = None) -> None:
+    def _show_runner(self, root: Path, preview: bool, cli_override: list | None = None) -> None:
         for w in self.winfo_children():
             w.destroy()
         self.geometry("1000x700")
         self.minsize(800, 540)
         self._scan_root = root
         self._last_was_preview = preview
-        self._media = media
-        media_zh = "自动识别" if media == "auto" else ("剧集" if media == "tv" else "电影")
-        self.title("TMDB 刮削命名 — " + media_zh + ("预览中" if preview else "更改中"))
+        self.title("TMDB 刮削命名 — " + ("预览中" if preview else "更改中"))
 
         bar = ttk.Frame(self)
         bar.pack(fill=tk.X, padx=12, pady=8)
         ttk.Label(
             bar,
-            text=(("预览" if preview else "正式刮削") + f"  ·  【{media_zh}】  ·  {root}"),
+            text=(("预览" if preview else "正式刮削") + f"  ·  {root}"),
             font=("Microsoft YaHei UI", 10, "bold"),
         ).pack(side=tk.LEFT)
         self.only_new_var = tk.BooleanVar(value=bool(getattr(self, "_only_new", True)))
@@ -556,7 +551,7 @@ class App(tk.Tk):
                 if key == "unmatched":
                     self.tab_trees[key].bind("<Double-1>", lambda e, t=self.tab_trees[key]: self._pick_candidate(t))
 
-        self._run(root, preview, media, cli_override)
+        self._run(root, preview, cli_override)
 
     def _set_tab_title(self, key: str, title: str, n: int) -> None:
         order = [k for k, _ in self._result_tab_defs]
@@ -577,7 +572,6 @@ class App(tk.Tk):
     def _fill_tree(self, key: str, rows: list) -> None:
         self._clear_tree(key)
         tree = self.tab_trees[key]
-        kind = "剧集" if getattr(self, "_media", "movie") == "tv" else "电影"
         if not hasattr(self, "_row_items"):
             self._row_items = {}
         for row in rows:
@@ -587,7 +581,7 @@ class App(tk.Tk):
                     self._row_items[(key, iid)] = row[4]
             else:
                 a, b, c = row[0], row[1], row[2]
-                tree.insert("", tk.END, values=(kind, a, b, c))
+                tree.insert("", tk.END, values=("电影", a, b, c))
         last = getattr(tree, "_last_sort", None)
         if last:
             self._sort_rows(tree, last[0], last[1])
@@ -712,7 +706,7 @@ class App(tk.Tk):
         if not ok:
             return
         self._last_was_preview = True
-        self._show_runner(Path(h.get("root") or "."), True, "auto", ["--undo"])
+        self._show_runner(Path(h.get("root") or "."), True, ["--undo"])
         self.btn_undo.configure(state=tk.DISABLED)
 
     def _export_csv(self) -> None:
@@ -726,7 +720,6 @@ class App(tk.Tk):
         if not path:
             return
         import csv
-        media = d["media"]
         rows = []
         done = {r.get("path"): r for r in d["ok"]}
         for p in d["plan"]:
@@ -735,7 +728,7 @@ class App(tk.Tk):
                 status = {"merge_version": "待合并版本", "merge_season": "待合并到季"}.get(act, "待改名")
             else:
                 status = {"merge_version": "已合并版本", "merge_season": "已合并到季"}.get(act, "已改名" if p.get("path") in done else "待改名")
-            rows.append([status, "剧集" if guess_lib_kind(p, media) == "tv" else "电影", p.get("name") or "",
+            rows.append([status, "剧集" if guess_lib_kind(p) == "tv" else "电影", p.get("name") or "",
                          p.get("target") or "", p.get("tmdb") or "",
                          p.get("version_label") or (f"Season {p['season_no']:02d}" if p.get("season_no") is not None else ""),
                          p.get("version_info") or "", ""])
@@ -770,16 +763,15 @@ class App(tk.Tk):
         if root is None:
             messagebox.showerror("无目录", "没有可更改的扫描目录。")
             return
-        media_zh = "自动识别" if getattr(self, "_media", "auto") == "auto" else ("剧集" if self._media == "tv" else "电影")
         ok = messagebox.askyesno(
             "确认正式刮削",
-            f"媒体: {media_zh}\n将按刚才预览的同一目录执行正式更改：\n{root}\n\n"
+            f"将按刚才预览的同一目录执行正式更改：\n{root}\n\n"
             "会改名、下载缺的图片、写缺的 nfo。\n确定开始？",
         )
         if not ok:
             return
         self._last_was_preview = False
-        self.title(f"TMDB 刮削命名 — {media_zh}更改中")
+        self.title("TMDB 刮削命名 — 更改中")
         self.btn_apply.configure(state=tk.DISABLED)
         self.btn_stop.configure(state=tk.NORMAL)
         self.btn_again.configure(state=tk.DISABLED)
@@ -788,8 +780,8 @@ class App(tk.Tk):
         self.notebook.select(0)
         self._log("")
         self._log("——" * 20)
-        self._log("用户确认：开始正式刮削（同一目录 / 同一媒体类型）")
-        self._run(root, False, self._media)
+        self._log("用户确认：开始正式刮削（同一目录）")
+        self._run(root, False)
 
     def _load_results(self) -> None:
         last_path = data_dir() / "tmdb_format_rename_last.json"
@@ -818,22 +810,16 @@ class App(tk.Tk):
         unresolved = data.get("unresolved") or []
 
         preview = bool(data.get("preview"))
-        media = data.get("media") or getattr(self, "_media", "movie") or "movie"
-        media_zh = "自动识别" if media == "auto" else ("剧集" if media == "tv" else "电影")
 
         ok_list = list(apply.get("ok") or [])
         rename_fail_list = list(apply.get("fail") or [])
-        # 改名成功/失败里的「改名结果」只保留本次扫描同 root+media；预览不显示旧改名成功
-        apply_media = (apply.get("media") or "").strip()
+        # 改名成功/失败里的「改名结果」只保留本次扫描同一目录；预览不显示旧改名成功
         apply_root = (apply.get("root") or "").rstrip("\\/")
         data_root = str(data.get("root") or "").rstrip("\\/")
-        data_media = (media or "").strip()
         same_run = True
         if preview:
             same_run = False
         elif apply.get("cleared"):
-            same_run = False
-        elif apply_media and data_media and apply_media != data_media:
             same_run = False
         elif apply_root and data_root and apply_root.lower() != data_root.lower():
             same_run = False
@@ -854,17 +840,11 @@ class App(tk.Tk):
         tip = ""
         if preview and self._last_was_preview:
             tip = "  → 可点右上角「确认并正式刮削」"
-        # Keep runner media in sync with result JSON (avoid mixing movie/tv reads)
-        self._media = media
-        self.title(f"TMDB 刮削命名 — 【{media_zh}】结果")
+        self.title("TMDB 刮削命名 — 结果")
 
         lines = [
-            f"★★ 本次模式：【{media_zh}】 ★★",
-            f"请按【{media_zh}】整理到对应库，不要和另一类混放。",
-            "",
             f"扫描根目录：{data.get('root', '')}",
-            f"媒体类型：【{media_zh}】",
-            f"模式：{mode}",
+            f"模式：{mode}（电影和剧集一起识别）",
             "",
             "分类说明：",
             f"  · 电影识别 / 剧集识别（{leaf_count}）：已拿到 TMDB 编号",
@@ -886,7 +866,7 @@ class App(tk.Tk):
         self.overview_text.configure(state=tk.DISABLED)
         self._set_tab_title("overview", "概览", 1)
 
-        # Split by each item's TMDB media type (stamped by scraper), not run mode alone
+        # Split by each item's TMDB media type (stamped by scraper)
         id_items = list(leaves) if leaves else list(already_ok)
         movie_rows = []
         tv_rows = []
@@ -894,7 +874,7 @@ class App(tk.Tk):
             path = L.get("path") or ""
             name = L.get("name") or path
             note = f"tmdb={L.get('tmdb') or '?'}"
-            kind = guess_lib_kind(L, media)
+            kind = guess_lib_kind(L)
             type_zh = "剧集" if kind == "tv" else "电影"
             row = (type_zh, name, note, path)
             if kind == "tv":
@@ -916,7 +896,7 @@ class App(tk.Tk):
             for p in plan:
                 change_rows.append(
                     (
-                        ("剧集" if guess_lib_kind(p, media) == "tv" else "电影"),
+                        ("剧集" if guess_lib_kind(p) == "tv" else "电影"),
                         p.get("name") or p.get("path") or "",
                         self._change_label(p, "待更改"),
                         f"→ {p.get('target') or p.get('dest') or ''}",
@@ -929,7 +909,7 @@ class App(tk.Tk):
             for r in src_rows:
                 change_rows.append(
                     (
-                        ("剧集" if guess_lib_kind(r, media) == "tv" else "电影"),
+                        ("剧集" if guess_lib_kind(r) == "tv" else "电影"),
                         r.get("name") or r.get("path") or "",
                         self._change_label(r, label),
                         r.get("final")
@@ -948,7 +928,7 @@ class App(tk.Tk):
                 continue
             if action == "wrap_fail":
                 continue
-            type_zh = "剧集" if guess_lib_kind(w, media) == "tv" else "电影"
+            type_zh = "剧集" if guess_lib_kind(w) == "tv" else "电影"
             name = w.get("stem") or w.get("video") or w.get("name") or ""
             detail = w.get("folder") or w.get("video") or w.get("reason") or ""
             if preview or action in {"would_wrap", ""}:
@@ -970,7 +950,7 @@ class App(tk.Tk):
                     f"电影={item.get('movie_tmdb') or '?'} / 剧集={item.get('tv_tmdb') or '?'} | "
                     + str(note)
                 )
-            kind = "剧集" if guess_lib_kind(item, media) == "tv" else "电影"
+            kind = "剧集" if guess_lib_kind(item) == "tv" else "电影"
             name = (
                 item.get("name")
                 or item.get("path")
@@ -991,7 +971,7 @@ class App(tk.Tk):
         for r in rename_fail_list:
             um_rows.append(
                 (
-                    ("剧集" if (r.get("media") or r.get("kind") or media) == "tv" else "电影"),
+                    ("剧集" if guess_lib_kind(r) == "tv" else "电影"),
                     r.get("name") or r.get("path") or "",
                     "改名失败",
                     r.get("error") or r.get("dest") or r.get("path") or "",
@@ -1004,7 +984,7 @@ class App(tk.Tk):
             ):
                 um_rows.append(
                     (
-                        ("剧集" if (w.get("media") or w.get("kind") or media) == "tv" else "电影"),
+                        ("剧集" if guess_lib_kind(w) == "tv" else "电影"),
                         w.get("stem") or w.get("video") or w.get("name") or "",
                         zh_reason(action if action != "skip_no_tmdb" else "skip_no_tmdb"),
                         w.get("folder") or w.get("video") or w.get("reason") or "",
@@ -1041,7 +1021,7 @@ class App(tk.Tk):
 
         self._um_all = um_rows
         self._refill_unmatched()
-        self._export_data = {"plan": plan, "ok": ok_list, "skip": skip, "unresolved": unresolved, "um": um_rows, "media": media, "preview": preview}
+        self._export_data = {"plan": plan, "ok": ok_list, "skip": skip, "unresolved": unresolved, "um": um_rows, "preview": preview}
         try:
             self.btn_export.configure(state=tk.NORMAL)
         except Exception:
@@ -1049,7 +1029,7 @@ class App(tk.Tk):
 
         self.summary.configure(
             text=(
-                f"【{media_zh}】{mode}完成 · 已识别 {leaf_count} · 更改(待) {plan_count} · "
+                f"{mode}完成 · 已识别 {leaf_count} · 更改(待) {plan_count} · "
                 f"已正确命名 {len(already_ok)} · 需要确认 {len(um_rows)} · "
                 f"散落(入更改) {wrap_count} · 更改(已) {ok_count}"
                 + tip
@@ -1079,7 +1059,7 @@ class App(tk.Tk):
         self.log.insert(tk.END, line.rstrip() + "\n")
         self.log.see(tk.END)
 
-    def _run(self, root: Path, preview: bool, media: str, cli_override: list | None = None) -> None:
+    def _run(self, root: Path, preview: bool, cli_override: list | None = None) -> None:
         if not cli_override and not self._persist_api_key():
             messagebox.showerror(
                 "缺少 API Key",
@@ -1090,7 +1070,7 @@ class App(tk.Tk):
         os.environ["TMDB_TOOLS_DIR"] = str(data_dir())
         os.environ["PYTHONIOENCODING"] = "utf-8"
         frozen = bool(getattr(sys, "frozen", False))
-        cli = [str(root), f"--media={media}"]
+        cli = [str(root)]
         if getattr(self, "_only_new", False):
             cli.append("--only-new")
         if preview:
