@@ -91,26 +91,6 @@ def read_saved_api_key() -> str:
     return (os.environ.get("TMDB_API_KEY") or "").strip()
 
 
-LANG_CHOICES = {"自动（中文优先）": "auto", "繁体中文": "zh-TW", "英文": "en"}
-DEFAULT_TEMPLATE = "{title} ({year}) [tmdbid={tid}]"
-ORIGINAL_TEMPLATE = "{original} ({year}) [tmdbid={tid}]"
-NAME_CHOICES = {"标题 (年份) [tmdbid=编号]": DEFAULT_TEMPLATE, "原名 (年份) [tmdbid=编号]": ORIGINAL_TEMPLATE}
-
-
-def load_settings() -> dict:
-    try:
-        return json.loads((data_dir() / "gui_settings.json").read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def save_settings(d: dict) -> None:
-    try:
-        (data_dir() / "gui_settings.json").write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
-
-
 def last_history() -> dict | None:
     """The newest change-history file of a real run (what 撤销上次改名 would undo)."""
     d = data_dir() / "history"
@@ -225,8 +205,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("TMDB 刮削命名")
-        self.geometry("760x700")
-        self.minsize(680, 640)
+        self.geometry("760x600")
+        self.minsize(680, 560)
         self.tools = find_tools_dir()
         self.script = self.tools / "tmdb_format_rename.py"
         self.proc = None
@@ -286,24 +266,8 @@ class App(tk.Tk):
             text="标题对不上、没写年份又有同名候选、或剧集/电影类型对不上的，默认不改名，列在「需要确认」里并写明原因和候选。先预览确认，再勾选。",
         ).pack(anchor="w", padx=28, pady=(0, 8))
 
-        st = load_settings()
-        fmt = ttk.LabelFrame(top, text="命名与语言")
+        fmt = ttk.LabelFrame(top, text="自动整理")
         fmt.pack(fill=tk.X, pady=(0, 10))
-        r1 = ttk.Frame(fmt)
-        r1.pack(fill=tk.X, padx=8, pady=(6, 2))
-        ttk.Label(r1, text="标题语言").pack(side=tk.LEFT)
-        lang_names = list(LANG_CHOICES)
-        self.lang_var = tk.StringVar(value=st.get("lang") if st.get("lang") in lang_names else lang_names[0])
-        ttk.Combobox(r1, textvariable=self.lang_var, values=lang_names, state="readonly", width=16).pack(side=tk.LEFT, padx=8)
-        ttk.Label(r1, text="只影响文件夹名；找不到该语言的标题时用默认（中文优先）。", foreground="#666").pack(side=tk.LEFT)
-        r2 = ttk.Frame(fmt)
-        r2.pack(fill=tk.X, padx=8, pady=2)
-        ttk.Label(r2, text="文件夹格式").pack(side=tk.LEFT)
-        name_labels = list(NAME_CHOICES)
-        cur = next((k for k, v in NAME_CHOICES.items() if v == st.get("template")), name_labels[0])
-        self.tpl_var = tk.StringVar(value=cur)
-        ttk.Combobox(r2, textvariable=self.tpl_var, values=name_labels, state="readonly", width=28).pack(side=tk.LEFT, padx=8)
-        ttk.Label(r2, text="二选一：用标题（受上面语言影响），或用 TMDB 的原名。", foreground="#666").pack(side=tk.LEFT)
         ttk.Label(
             fmt,
             text="同一部剧各季的独立文件夹会自动合并到「剧名/Season NN」；同一部电影的不同版本会合并并加版本标记。预览里逐条列出，改错可「撤销上次改名」。",
@@ -409,8 +373,6 @@ class App(tk.Tk):
                 "请填写 TMDB API Key。\n它会保存在 %AppData%\\Roaming\\TMDB刮削命名\\tmdb_api_key.txt。",
             )
             return
-        tpl = NAME_CHOICES.get(self.tpl_var.get(), DEFAULT_TEMPLATE)
-        save_settings({"lang": self.lang_var.get(), "template": tpl})
         media = "auto"
         self._only_new = bool(self.only_new_var.get()) if getattr(self, "only_new_var", None) is not None else bool(getattr(self, "_only_new", True))
         self._sync_accept_uncertain()
@@ -1162,7 +1124,7 @@ class App(tk.Tk):
             return
         for w in self.winfo_children():
             w.destroy()
-        self.geometry("760x700")
+        self.geometry("760x600")
         self.title("TMDB 刮削命名")
         self._scan_root = None
         self._last_was_preview = False
@@ -1191,13 +1153,6 @@ class App(tk.Tk):
             cli.append("--accept-uncertain")
         if preview:
             cli.append("--preview")
-        st = load_settings()
-        lang = LANG_CHOICES.get(st.get("lang") or "", "auto")
-        if lang != "auto":
-            cli.append(f"--title-lang={lang}")
-        tpl = (st.get("template") or "").strip()
-        if tpl == ORIGINAL_TEMPLATE:
-            cli.append(f"--name-template={tpl}")
         if cli_override:
             cli = list(cli_override)
         self._log("=" * 60)

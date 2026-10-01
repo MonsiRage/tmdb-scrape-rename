@@ -436,49 +436,7 @@ def _normalize_tv_payload(d):
     return out
 
 
-NAME_TEMPLATE = ""      # e.g. "{title} ({year}) [tmdbid={tid}]"; empty = the default pattern
-TITLE_LANG = "auto"     # auto (Chinese first) | zh-TW | en | original
-DEFAULT_TEMPLATE = "{title} ({year}) [tmdbid={tid}]"
-
-
-def valid_template(tpl: str) -> bool:
-    """Only two folder patterns exist: title-based or original-name-based (never both)."""
-    return tpl in (DEFAULT_TEMPLATE, "{original} ({year}) [tmdbid={tid}]")
-
-
-def render_name(tpl: str, title: str, year, tid, original: str = "", edition: str = "") -> str:
-    """Fill a naming template. Tokens: {title} {year} {tid} {original} {edition}.
-    Empty tokens vanish together with their brackets; the [tmdbid=N] tag is always kept."""
-    vals = {
-        "title": title or "",
-        "year": str(year) if year and re.fullmatch(r"\d{4}", str(year)) else "",
-        "tid": str(tid or ""),
-        "original": original or "",
-        "edition": edition or "",
-    }
-    out = tpl
-    for k, v in vals.items():
-        if not v:
-            out = re.sub(r"[\(\[（【]\s*\{%s\}\s*[\)\]）】]" % k, "", out)
-            out = out.replace("{%s}" % k, "")
-    for k, v in vals.items():
-        out = out.replace("{%s}" % k, v)
-    out = re.sub(r"\s{2,}", " ", out).strip(" ._-")
-    out = re.sub(r"(?:\s[-–]\s*)+$", "", out)
-    if vals["tid"] and "[tmdbid=" not in out:
-        out += f" [tmdbid={vals['tid']}]"
-    return out
-
-
-def edition_of(text: str) -> str:
-    for pat, lab in _VERSION_EDITIONS:
-        if re.search(pat, text or "", re.I):
-            return lab
-    return ""
-
-
-def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str = "",
-                    original: str = "", edition: str = "") -> str:
+def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str = "") -> str:
     """Keep full title when path budget allows; shorten only as needed."""
     title = win_safe(title or "") or "untitled"
     year_s = str(year) if year and re.fullmatch(r"\d{4}", str(year)) else ""
@@ -491,8 +449,6 @@ def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str
         return len(name) <= budget
 
     cands = []
-    if NAME_TEMPLATE and tid and (original or "{original}" not in NAME_TEMPLATE):
-        cands.append(render_name(NAME_TEMPLATE, title, year_s, tid, original, edition))
     if tid and year_s:
         cands.append(f"{title} ({year_s}) [tmdbid={tid}]")
     if year_s:
@@ -5499,45 +5455,6 @@ def apply_version_names(folder: Path, base: str, label: str, video_names: list) 
                 _rename_one(sc, sdst)
 
 
-def lang_title(meta: dict, mode: str):
-    """The title in the requested language, or None when TMDB has none (caller keeps the default)."""
-    if mode == "original":
-        return (meta.get("original_title") or "").strip() or None
-    if mode == "en":
-        return (meta.get("title_enus") or "").strip() or None
-    if mode == "zh-TW":
-        t = (meta.get("title_twr") or "").strip()
-        return t if readable_han_title(t) else None
-    return None
-
-
-def prefetch_title_lang(leaves: list, cache: dict) -> None:
-    """Fetch the English / Traditional-Chinese titles that the chosen language needs (cached in meta)."""
-    mode = TITLE_LANG
-    if mode not in ("en", "zh-TW"):
-        return
-    field, lang = ("title_enus", "en-US") if mode == "en" else ("title_twr", "zh-TW")
-    todo = {}
-    for L in leaves:
-        if not L.get("tmdb"):
-            continue
-        kind = L.get("media") if L.get("media") in ("movie", "tv") else ("tv" if media_is_tv() else "movie")
-        meta = cache.get(ckey(L["tmdb"], kind))
-        if isinstance(meta, dict) and meta.get("ok") and field not in meta:
-            todo[(str(L["tmdb"]), kind)] = meta
-
-    def one(item):
-        (tid, kind), meta = item
-        d = api_get(f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}&language={lang}")
-        t = ""
-        if isinstance(d, dict) and not d.get("_error"):
-            t = (d.get("title") or d.get("name") or "").strip()
-        meta[field] = t
-        return None
-
-    list(_pmap(one, list(todo.items())))
-
-
 def tv_counts(tid: str, cache: dict) -> dict | None:
     """{"seasons": n, "episodes": n, "per": {season: episodes}} of a TMDB show (cached 14 days)."""
     ck = f"tvc:{tid}"
@@ -5786,20 +5703,8 @@ def main():
     no_nfo = "--no-nfo" in args
     preview_nfo = "--preview-nfo" in args
     only_new = "--only-new" in args
-    global MERGE_SEASONS, NAME_TEMPLATE, TITLE_LANG
+    global MERGE_SEASONS
     MERGE_SEASONS = "--no-merge-seasons" not in args
-    TITLE_LANG = "auto"
-    NAME_TEMPLATE = ""
-    for a in args:
-        if a.startswith("--title-lang="):
-            v = a.split("=", 1)[1].strip()
-            TITLE_LANG = v if v in ("auto", "zh-TW", "en") else "auto"
-        elif a.startswith("--name-template="):
-            v = a.split("=", 1)[1].strip().strip('"')
-            if valid_template(v):
-                NAME_TEMPLATE = v if v != DEFAULT_TEMPLATE else ""
-            else:
-                print(f"命名格式无效（只支持 {{title}} ({{year}}) [tmdbid={{tid}}] 或 {{original}} ({{year}}) [tmdbid={{tid}}]），已改用默认格式：{v}", flush=True)
     global ACCEPT_UNCERTAIN
     ACCEPT_UNCERTAIN = "--accept-uncertain" in args
     media = "auto"
@@ -5819,8 +5724,6 @@ def main():
         for a in args
         if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--accept-uncertain", "--no-merge-seasons", "--tv", "--media=tv", "--media=movie", "--media=auto")
         and not a.startswith("--media=")
-        and not a.startswith("--title-lang=")
-        and not a.startswith("--name-template=")
     ]
     if not args:
         root = Path(os.environ.get("TMDB_RENAME_ROOT") or os.getcwd())
@@ -6051,8 +5954,6 @@ def main():
     plan, skip = [], []
     skip.extend(multidisc_skips)
     multidisc_dest_by_primary = {}
-    prefetch_title_lang(leaves, cache)
-    save_json(CACHE_PATH, cache)
     used = {}
     dupgroups: dict = {}
     for L in leaves:
@@ -6062,10 +5963,6 @@ def main():
         if meta.get("ok") and meta.get("picked_title"):
             title, year, lang = picked_title_from_cache(meta)
             source = "tmdb"
-            if TITLE_LANG != "auto":
-                alt = lang_title(meta, TITLE_LANG)
-                if alt:
-                    title, lang = alt, TITLE_LANG
         if not title:
             nfo = find_nfo_meta(Path(L["path"]))
             t = (nfo.get("title") or nfo.get("originaltitle") or "").strip()
@@ -6077,11 +5974,7 @@ def main():
             continue
         parent = L["parent"]
         try:
-            target = fit_folder_name(
-                title, year, tid, Path(parent),
-                original=(meta.get("original_title") or ""),
-                edition=edition_of(L["name"] + " " + " ".join(_leaf_video_stems(Path(L["path"]), 4))),
-            )
+            target = fit_folder_name(title, year, tid, Path(parent))
         except Exception:
             target = build_name(title, year, tid)
         key = (parent.lower(), target.lower())
