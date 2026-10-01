@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v1.8"
+        description: "Release tag, e.g. v1.9"
         required: true
-        default: "v1.8"
+        default: "v1.9"
 
 permissions:
   contents: write
@@ -37,13 +37,14 @@ jobs:
           $notes = @'
           Windows 可执行版。不需要安装 Python，也不需要旁边的 .py。
 
-          这一版处理同名撞车，并补上一批识别问题：
+          这一版新增：电影按视频时长核对（只处理电影的 MP4 / MOV / M4V / MKV / WEBM）。
 
-          - 「未能匹配」里双击一行，可以从候选里选一个（或直接填 TMDB 编号）；选完再点「仅预览」/「确认刮削」就按你的选择处理。候选写明了年份、国家、编号
-          - 文件夹名里的版本词会用来筛同名候选：美版、英版、日版、韩版、瑞典版……，以及 (US) / (UK)、Shameless.US.S01E01 这类写法
-          - 文件夹没写年份时，用里面视频文件名一致的年份
-          - 没写年份的 `WALL-E`、`Wall E` 现在也能找到 `WALL·E`；标题里的空格、连字符、间隔号不再影响比对
-          - 带有「不确定」「候选」说明的条目不会被自动改名，除非勾选「同时改名不确定的」
-          - 上一版的防错配、剧集（Season 子文件夹、tvshow.nfo）、电影/剧集同编号处理都保留
+          - 视频时长和匹配到的电影在 TMDB 的片长对不上、但和另一部同名片吻合时，不自动改名，列入「未能匹配」，并写出各候选的年份和片长，可以双击选择
+          - 用来发现「文件夹年份起错了一年、其实是另一部同名片」的情况
+          - 窗口放得宽：不同剪辑版也算对得上（例如《末代皇帝》163 分钟院线版和约 219 分钟加长版都通过）；名字里写了 Extended / Director's Cut / 加长版 等词时更宽
+          - 只是时长不同、而标题和年份都吻合的，只在日志里提示，照常改名
+          - 读不出时长的文件（其它封装格式、损坏文件）直接忽略，不影响原来的识别
+          - 局限：两部同名片片长接近时分不开；TMDB 没有片长记录的片无法核对
+          - 上一版的同名撞车手动选择、版本词筛选、防错配、剧集支持都保留
           '@
           gh release create "${{ inputs.tag }}" dist\TMDB-scrape-rename.exe --title "${{ inputs.tag }}" --notes "$notes" --target "${{ github.sha }}"
