@@ -436,7 +436,49 @@ def _normalize_tv_payload(d):
     return out
 
 
-def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str = "") -> str:
+NAME_TEMPLATE = ""      # e.g. "{title} ({year}) [tmdbid={tid}]"; empty = the default pattern
+TITLE_LANG = "auto"     # auto (Chinese first) | zh-TW | en | original
+DEFAULT_TEMPLATE = "{title} ({year}) [tmdbid={tid}]"
+
+
+def valid_template(tpl: str) -> bool:
+    """Only two folder patterns exist: title-based or original-name-based (never both)."""
+    return tpl in (DEFAULT_TEMPLATE, "{original} ({year}) [tmdbid={tid}]")
+
+
+def render_name(tpl: str, title: str, year, tid, original: str = "", edition: str = "") -> str:
+    """Fill a naming template. Tokens: {title} {year} {tid} {original} {edition}.
+    Empty tokens vanish together with their brackets; the [tmdbid=N] tag is always kept."""
+    vals = {
+        "title": title or "",
+        "year": str(year) if year and re.fullmatch(r"\d{4}", str(year)) else "",
+        "tid": str(tid or ""),
+        "original": original or "",
+        "edition": edition or "",
+    }
+    out = tpl
+    for k, v in vals.items():
+        if not v:
+            out = re.sub(r"[\(\[（【]\s*\{%s\}\s*[\)\]）】]" % k, "", out)
+            out = out.replace("{%s}" % k, "")
+    for k, v in vals.items():
+        out = out.replace("{%s}" % k, v)
+    out = re.sub(r"\s{2,}", " ", out).strip(" ._-")
+    out = re.sub(r"(?:\s[-–]\s*)+$", "", out)
+    if vals["tid"] and "[tmdbid=" not in out:
+        out += f" [tmdbid={vals['tid']}]"
+    return out
+
+
+def edition_of(text: str) -> str:
+    for pat, lab in _VERSION_EDITIONS:
+        if re.search(pat, text or "", re.I):
+            return lab
+    return ""
+
+
+def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str = "",
+                    original: str = "", edition: str = "") -> str:
     """Keep full title when path budget allows; shorten only as needed."""
     title = win_safe(title or "") or "untitled"
     year_s = str(year) if year and re.fullmatch(r"\d{4}", str(year)) else ""
@@ -449,6 +491,8 @@ def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str
         return len(name) <= budget
 
     cands = []
+    if NAME_TEMPLATE and tid and (original or "{original}" not in NAME_TEMPLATE):
+        cands.append(render_name(NAME_TEMPLATE, title, year_s, tid, original, edition))
     if tid and year_s:
         cands.append(f"{title} ({year_s}) [tmdbid={tid}]")
     if year_s:
@@ -518,6 +562,14 @@ BARE_ID_RE = re.compile(r"^\d{3,}$")  # folder name is only digits
 YEAR_RE = re.compile(
     rf"(?:^|[^\d]|{_META_OPEN}){_META_SEP}((?:19|20)\d{{2}})(?:{_META_SEP}(?:{_META_CLOSE})|(?=[^\d]|$))"
 )
+def strip_tmdb_markers(s: str) -> str:
+    """Remove [tmdbid=N] / tmdbid=N / [12345] from a name. An id between 1900 and 2099
+    (怒火攻心 (2006) [tmdbid=1948]) must never be read as a release year."""
+    s = TMDB_RE.sub(" ", s or "")
+    s = TMDB_EQ_RE.sub(" ", s)
+    return BRACKET_ID_RE.sub(" ", s)
+
+
 HAN_RE = re.compile(r"[\u4e00-\u9fff]")
 KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
 LATIN_RE = re.compile(r"[A-Za-z]")
@@ -1347,10 +1399,28 @@ def extract_year(name: str):
     s = name or ""
     if re.search(r"(?:19|20)\d{2}\s*[–—\-]\s*(?:19|20)\d{2}", s):
         return None
+    s = strip_tmdb_markers(s)
+    # A year in brackets is the release year; a bare 4-digit number next to it
+    # (怒火攻心 (2006) 1948) may be an id or part of the title.
+    bracketed = re.findall(r"[\(\[（【]\s*((?:19|20)\d{2})\s*[\)\]）】]", s)
+    if bracketed:
+        return bracketed[-1]
     years = YEAR_RE.findall(s)
     if not years:
         return None
     return years[-1]
+
+
+def other_year_candidates(name: str, year: str | None) -> list:
+    """Other year-looking numbers in a name, last first: tried when the chosen year finds nothing."""
+    s = strip_tmdb_markers(name or "")
+    if re.search(r"(?:19|20)\d{2}\s*[–—\-]\s*(?:19|20)\d{2}", s):
+        return []
+    out = []
+    for y in reversed(YEAR_RE.findall(s)):
+        if y != year and y not in out:
+            out.append(y)
+    return out
 
 
 def strip_year_range_tokens(s: str) -> str:
@@ -1658,6 +1728,8 @@ def extract_search_queries(name: str) -> list[str]:
     # everything before the release year, if it holds a lone number token.
     _num_title = ""
     _yms = list(YEAR_RE.finditer(raw))
+    if _yms and TMDB_RE.search(raw):
+        _yms = []  # an id like [tmdbid=1948] is not a year
     if _yms:
         _pre = re.sub(r"[._]+", " ", raw[: _yms[-1].start(1)])
         _pre = re.sub(r"[\s\(\[【（\-]+$", "", _pre).strip()
@@ -2115,8 +2187,12 @@ def folder_title_components(name: str) -> list[str]:
     """
     n = strip_season_tokens(strip_site_tags(name or ""))
     n = re.sub(r"\.(mkv|mp4|iso|ts|m2ts|avi|mov|wmv)$", "", n, flags=re.I)
+    n = strip_tmdb_markers(n)
     years = list(YEAR_RE.finditer(n))
     cut = years[-1].start(1) if years else len(n)
+    bracketed = list(re.finditer(r"[\(\[（【]\s*((?:19|20)\d{2})\s*[\)\]）】]", n))
+    if bracketed:  # (2006) is the year even when another number follows it
+        cut = bracketed[-1].start(1)
     tm = _TECH_CUT_RE.search(n)
     if tm and tm.start() < cut:
         cut = tm.start()
@@ -2917,6 +2993,8 @@ def merge_folder_into(src: Path, dest: Path) -> None:
     """Move all children of src into dest, then remove empty src."""
     if not src.exists():
         return
+    if not dest.exists():
+        _log_op("mkdir", path=str(dest))
     dest.mkdir(parents=True, exist_ok=True)
     try:
         if src.resolve() == dest.resolve():
@@ -2930,6 +3008,7 @@ def merge_folder_into(src: Path, dest: Path) -> None:
     try:
         if src.exists() and not any(src.iterdir()):
             src.rmdir()
+            _log_op("rmdir", path=str(src))
     except Exception:
         pass
 
@@ -2970,6 +3049,7 @@ def flatten_disc_subfolders(folder: Path) -> list[str]:
                         pass
             if sub.exists() and not any(sub.iterdir()):
                 sub.rmdir()
+                _log_op("rmdir", path=str(sub))
         except Exception:
             pass
     return moved
@@ -3113,13 +3193,14 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
             continue
         # Dedicated movie leaf (incl. multi-ISO anthology): never treat as loose,
         # even when the scan root *is* that folder.
-        if is_dedicated_movie_leaf(d):
-            continue
-
         try:
             is_root = d.resolve() == root.resolve()
         except Exception:
             is_root = str(d) == str(root)
+        # A scan root with movie folders in it is a library: one stray video next to
+        # them is a loose video, not "the" movie of that folder.
+        if is_dedicated_movie_leaf(d) and not (is_root and interesting_subdirs(d)):
+            continue
         if not is_root and len(videos) < 2:
             continue
 
@@ -3241,15 +3322,18 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
                         if not dest_dir.exists():
                             Path(long_path(dest_dir)).mkdir(parents=True, exist_ok=True)
                             created = True
+                            _log_op("mkdir", path=str(dest_dir))
                         final_dest = dest_file
                         if Path(long_path(dest_file)).exists():
                             final_dest = dest_dir / f"{vf.stem}_moved{vf.suffix}"
                         shutil.move(long_path(vf), long_path(final_dest))
+                        _log_op("rename", src=str(vf), dst=str(final_dest))
                         for sc in side:  # subtitles / nfo that belong to the video go with it
                             try:
                                 target = dest_dir / sc.name
                                 if not Path(long_path(target)).exists():
                                     shutil.move(long_path(sc), long_path(target))
+                                    _log_op("rename", src=str(sc), dst=str(target))
                             except Exception:
                                 pass
                         rec["action"] = "wrapped"
@@ -3592,6 +3676,11 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                     tv_t or "?",
                     tv_s,
                 )
+                # Both are offered in the picker (double-click in 未能匹配).
+                leaf["candidates"] = [
+                    {"media": "movie", "tmdb": str(tid0), "title": mv_t, "original": "", "year": "", "country": "", "lang": ""},
+                    {"media": "tv", "tmdb": str(tid0), "title": tv_t, "original": "", "year": "", "country": "", "lang": ""},
+                ]
                 leaf["tmdb"] = None
                 return False
             leaf["id_from"] = "no_tmdb_id"
@@ -3644,6 +3733,11 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                     tv_t or "?",
                     tv_s,
                 )
+                # Both are offered in the picker (double-click in 未能匹配).
+                leaf["candidates"] = [
+                    {"media": "movie", "tmdb": str(tid), "title": mv_t, "original": "", "year": "", "country": "", "lang": ""},
+                    {"media": "tv", "tmdb": str(tid), "title": tv_t, "original": "", "year": "", "country": "", "lang": ""},
+                ]
                 leaf["tmdb"] = None
                 return False
             leaf["id_from"] = "no_tmdb_id"
@@ -3656,7 +3750,7 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
         leaf["media"] = "tv" if media_is_tv() else "movie"
         leaf["id_from"] = "nfo"
         return True
-    year = extract_year(leaf["name"])
+    year = leaf.get("_year_override") or extract_year(leaf["name"])
     if not year and meta.get("year"):
         y = str(meta.get("year"))[:4]
         if y.isdigit():
@@ -3815,6 +3909,16 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
         leaf["search_year"] = year
         return False
     # A later "no results" must not hide that an earlier query failed to reach TMDB.
+    if not saw_search_error and not leaf.get("_year_retry"):
+        # Nothing found for this year: the name may carry another year-looking number.
+        alts = other_year_candidates(leaf.get("name") or "", year)
+        if alts:
+            leaf["_year_retry"] = True
+            leaf["_year_override"] = alts[0]
+            if resolve_leaf_id(leaf, search_cache):
+                return True
+            if leaf.get("id_from") in ("uncertain_title_only", "ambiguous_movie_and_tv", "ambiguous_no_year"):
+                return False
     leaf["id_from"] = "search_error" if saw_search_error else (last_how or "unresolved")
     leaf["search_query"] = last_query or (queries[0] if queries else "")
     leaf["search_year"] = year
@@ -3854,6 +3958,7 @@ def _download_bytes(url: str, dest: Path, min_size: int = 500) -> str:
                 except Exception:
                     pass
             tmp.replace(dest)
+            _log_op("create", path=str(dest))
             return "ok"
         except Exception as e:
             last_err = str(e)
@@ -4268,6 +4373,7 @@ def write_tmdb_html(folder: Path, meta: dict, tid: str, preview: bool = False) -
         html = build_tmdb_html(meta, str(tid), folder)
         dest = folder / "tmdb.html"
         dest.write_text(html, encoding="utf-8")
+        _log_op("create", path=str(dest))
         return f"ok:{dest.name}"
     except Exception as e:
         return f"err:{e}"
@@ -4287,6 +4393,7 @@ def write_movie_nfo(folder: Path, meta: dict, tid: str, preview: bool = False, k
             return "would_write_nfo:tvshow.nfo"
         try:
             (folder / "tvshow.nfo").write_text(build_nfo_xml(meta, tid, root="tvshow"), encoding="utf-8")
+            _log_op("create", path=str(folder / "tvshow.nfo"))
             return "ok:tvshow.nfo"
         except Exception as e:
             return f"err:{e}"
@@ -4306,11 +4413,13 @@ def write_movie_nfo(folder: Path, meta: dict, tid: str, preview: bool = False, k
         if not videos:
             dest = folder / "movie.nfo"
             dest.write_text(xml, encoding="utf-8")
+            _log_op("create", path=str(dest))
             written.append(dest.name)
         else:
             for vf in videos:
                 dest = folder / f"{vf.stem}.nfo"
                 dest.write_text(xml, encoding="utf-8")
+                _log_op("create", path=str(dest))
                 written.append(dest.name)
             # Do NOT delete existing movie.nfo — Emby primary; we only write when none existed.
         return "ok:" + ",".join(written)
@@ -4438,10 +4547,111 @@ def apply_artwork_and_nfo(
     return art_stats, nfo_stats, html_stats, samples
 
 
+# ---------------------------------------------------------------------------
+# Change log: every move / rename / created file / removed empty folder of a real
+# run is recorded, so "undo last run" can put things back.
+# ---------------------------------------------------------------------------
+CHANGE_LOG: list = []
+_RUN_STAMP: list = [None]
+_CHANGE_LOCK = threading.Lock()
+
+
+def _log_op(op: str, **kw) -> None:
+    with _CHANGE_LOCK:
+        CHANGE_LOG.append({"op": op, **kw})
+
+
+def history_dir() -> Path:
+    return TOOLS / "history"
+
+
+def save_history(root) -> None:
+    """Write (overwrite) this run's history file. Called after each phase of a real run."""
+    with _CHANGE_LOCK:
+        ops = list(CHANGE_LOG)
+    if not ops:
+        return
+    if _RUN_STAMP[0] is None:
+        _RUN_STAMP[0] = datetime.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        history_dir().mkdir(parents=True, exist_ok=True)
+        path = history_dir() / f"{_RUN_STAMP[0]}.json"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps({"root": str(root), "time": _RUN_STAMP[0], "ops": ops}, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        os.replace(str(tmp), str(path))
+    except Exception as e:
+        print(f"  warn: could not save the change history: {e}", flush=True)
+
+
+def list_history() -> list:
+    d = history_dir()
+    try:
+        return sorted((p for p in d.glob("*.json") if not p.name.endswith(".undone.json")), reverse=True)
+    except Exception:
+        return []
+
+
+def undo_last_run() -> int:
+    """Reverse the newest recorded real run. Returns the number of problems."""
+    files = list_history()
+    if not files:
+        print("没有可以撤销的改名记录。", flush=True)
+        return 0
+    path = files[0]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"读不了改名记录 {path.name}: {e}", flush=True)
+        return 1
+    ops = data.get("ops") or []
+    print(f"撤销 {data.get('time')} 的那一次（{data.get('root')}），共 {len(ops)} 步 ...", flush=True)
+    done = skipped = 0
+    for o in reversed(ops):
+        try:
+            kind = o.get("op")
+            if kind == "create":
+                f = Path(o["path"])
+                if f.is_file():
+                    f.unlink()
+                    done += 1
+            elif kind == "rename":
+                src, dst = Path(o["src"]), Path(o["dst"])
+                if dst.exists() and not src.exists():
+                    src.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(str(dst), str(src))
+                    done += 1
+                else:
+                    skipped += 1
+                    print(f"  跳过（现在的状态和记录不符）: {dst.name} -> {src.name}", flush=True)
+            elif kind == "mkdir":
+                d = Path(o["path"])
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+                    done += 1
+            elif kind == "rmdir":
+                d = Path(o["path"])
+                if not d.exists():
+                    d.mkdir(parents=True, exist_ok=True)
+                    done += 1
+        except Exception as e:
+            skipped += 1
+            print(f"  撤销失败: {o} ({e})", flush=True)
+    try:
+        os.replace(str(path), str(path.with_name(path.stem + ".undone.json")))
+    except Exception:
+        pass
+    print(f"已撤销 {done} 步，跳过 {skipped} 步。", flush=True)
+    return skipped
+
+
 def _rename_one(src: Path, dest: Path) -> None:
     """Rename folder; fall back to cmd ren on WinError 50 (some cloud mounts)."""
     try:
         src.rename(dest)
+        _log_op("rename", src=str(src), dst=str(dest))
         return
     except OSError as e:
         if getattr(e, "winerror", None) != 50 and "not supported" not in str(e).lower():
@@ -4459,13 +4669,14 @@ def _rename_one(src: Path, dest: Path) -> None:
     if r.returncode != 0 or not dest.exists():
         err = (r.stderr or r.stdout or "").strip() or f"cmd ren failed code={r.returncode}"
         raise OSError(err)
+    _log_op("rename", src=str(src), dst=str(dest))
 
 
 def apply_renames(plan):
     ok, fail = [], []
     ordered = sorted(
         plan,
-        key=lambda r: 1 if (r.get("action") == "merge_into") else 0,
+        key=lambda r: 1 if (r.get("action") in ("merge_into", "merge_version", "merge_season")) else 0,
     )
 
     def _maybe_flatten(rec, dest: Path):
@@ -4494,6 +4705,23 @@ def apply_renames(plan):
                     dest = src if src.exists() else dest
                 flat = flatten_disc_subfolders(dest if dest.exists() else src)
                 ok.append({**rec, "final": str(dest if dest.exists() else src), "note": "flattened", "flattened": len(flat)})
+            elif action == "merge_season":
+                if not src.exists():
+                    fail.append({**rec, "error": "source_missing"})
+                else:
+                    if rec.get("season_no") is not None:
+                        move_into_season(src, dest, rec["season_no"])
+                    else:
+                        merge_folder_into(src, dest)
+                    ok.append({**rec, "final": str(dest), "note": "season_merged"})
+            elif action == "merge_version":
+                if not src.exists():
+                    fail.append({**rec, "error": "source_missing"})
+                else:
+                    apply_version_names(src, rec.get("version_base") or dest.name,
+                                        rec.get("version_label") or "", rec.get("version_videos") or [])
+                    merge_folder_into(src, dest)
+                    ok.append({**rec, "final": str(dest), "note": "version_merged"})
             elif action == "merge_into":
                 if not src.exists():
                     ok.append({**rec, "final": str(dest), "note": "merge_src_missing"})
@@ -4526,6 +4754,11 @@ def apply_renames(plan):
                 else:
                     if str(src) != str(dest):
                         _rename_one(src, dest)
+                    if rec.get("season_wrap") is not None:
+                        wrap_into_season(dest, rec["season_wrap"])
+                    if rec.get("version_label"):
+                        apply_version_names(dest, rec.get("version_base") or dest.name,
+                                            rec["version_label"], rec.get("version_videos") or [])
                     flat = _maybe_flatten(rec, dest)
                     ok.append({**rec, "final": str(dest), "flattened": len(flat)})
         except Exception as e:
@@ -4627,6 +4860,8 @@ def _zh_reason(code: str) -> str:
         "search_error": "搜索失败",
         "empty_query": "标题为空",
         "uncertain_title_only": "不确定：需要确认（未改名）",
+        "duplicate_movie": "重复影片（请决定保留哪个）",
+        "season_merge_unclear": "同一部剧的多个文件夹无法合并（请确认）",
     }.get(code or "", code or "?")
 
 
@@ -4713,7 +4948,7 @@ def _title_scores_for_id(tid: str, folder_name: str) -> tuple[int, int, str, str
     except Exception:
         folder_year = None
     if not folder_year:
-        m = re.search(r"(?:^|[^\d])((?:19|20)\d{2})(?:[^\d]|$)", folder_name)
+        m = re.search(r"(?:^|[^\d])((?:19|20)\d{2})(?:[^\d]|$)", strip_tmdb_markers(folder_name))
         if m:
             folder_year = m.group(1)
     if folder_year:
@@ -4810,7 +5045,8 @@ def stamp_item_media(item: dict) -> dict:
 # MP4/MOV/M4V (mvhd) and MKV/WEBM (Info/Duration). Anything else, or any
 # error, gives None and the check is simply skipped.
 # ---------------------------------------------------------------------------
-def _mp4_duration(f, size: int) -> float | None:
+def _mp4_info(f, size: int) -> dict | None:
+    """{"sec", "w", "h"} from an MP4/MOV: mvhd for the length, the widest tkhd for the picture size."""
     def walk(start: int, end: int, want: bytes):
         pos = start
         while pos + 8 <= end:
@@ -4833,18 +5069,31 @@ def _mp4_duration(f, size: int) -> float | None:
             pos += bsize
 
     for m_start, m_end in walk(0, size, b"moov"):
+        out = {"sec": None, "w": 0, "h": 0}
         for h_start, _h_end in walk(m_start, m_end, b"mvhd"):
             f.seek(h_start)
             body = f.read(32)
-            if len(body) < 20:
-                return None
-            if body[0] == 1 and len(body) >= 32:
-                timescale = int.from_bytes(body[20:24], "big")
-                dur = int.from_bytes(body[24:32], "big")
-            else:
-                timescale = int.from_bytes(body[12:16], "big")
-                dur = int.from_bytes(body[16:20], "big")
-            return dur / timescale if timescale else None
+            if len(body) >= 20:
+                if body[0] == 1 and len(body) >= 32:
+                    timescale = int.from_bytes(body[20:24], "big")
+                    dur = int.from_bytes(body[24:32], "big")
+                else:
+                    timescale = int.from_bytes(body[12:16], "big")
+                    dur = int.from_bytes(body[16:20], "big")
+                out["sec"] = dur / timescale if timescale else None
+            break
+        for t_start, t_end in walk(m_start, m_end, b"trak"):
+            for k_start, _k_end in walk(t_start, t_end, b"tkhd"):
+                f.seek(k_start)
+                body = f.read(96)
+                off = 88 if (body[:1] == b"\x01") else 76
+                if len(body) >= off + 8:
+                    w = int.from_bytes(body[off:off + 4], "big") >> 16
+                    h = int.from_bytes(body[off + 4:off + 8], "big") >> 16
+                    if w * h > out["w"] * out["h"]:
+                        out["w"], out["h"] = w, h
+                break
+        return out
     return None
 
 
@@ -4870,7 +5119,10 @@ def _ebml_vint(f, keep_marker: bool):
     return (None if unknown else val), length
 
 
-def _mkv_duration(f, size: int) -> float | None:
+def _mkv_info(f, size: int) -> dict | None:
+    """{"sec", "w", "h"} from an MKV/WEBM: Info/Duration and the video track's pixel size."""
+    import struct
+
     def children(start: int, end: int):
         pos = start
         for _ in range(4000):
@@ -4888,38 +5140,67 @@ def _mkv_duration(f, size: int) -> float | None:
                 return
             pos = stop
 
+    def uint(data: int, stop: int) -> int:
+        f.seek(data)
+        return int.from_bytes(f.read(stop - data), "big")
+
     for eid, data, stop in children(0, size):
         if eid != 0x18538067:  # Segment
             continue
+        out = {"sec": None, "w": 0, "h": 0}
+        got_info = False
         for cid, cdata, cstop in children(data, stop):
-            if cid == 0x1F43B675:  # Cluster before Info: not a normal file
-                return None
-            if cid != 0x1549A966:  # Info
-                continue
-            scale, dur = 1000000, None
-            for iid, idata, istop in children(cdata, cstop):
-                f.seek(idata)
-                raw = f.read(istop - idata)
-                if iid == 0x2AD7B1:
-                    scale = int.from_bytes(raw, "big") or 1000000
-                elif iid == 0x4489 and len(raw) in (4, 8):
-                    import struct
-                    dur = struct.unpack(">f" if len(raw) == 4 else ">d", raw)[0]
-            return dur * scale / 1e9 if dur else None
+            if cid == 0x1F43B675:  # first Cluster: header part is over
+                break
+            if cid == 0x1549A966:  # Info
+                scale, dur = 1000000, None
+                for iid, idata, istop in children(cdata, cstop):
+                    f.seek(idata)
+                    raw = f.read(istop - idata)
+                    if iid == 0x2AD7B1:
+                        scale = int.from_bytes(raw, "big") or 1000000
+                    elif iid == 0x4489 and len(raw) in (4, 8):
+                        dur = struct.unpack(">f" if len(raw) == 4 else ">d", raw)[0]
+                out["sec"] = dur * scale / 1e9 if dur else None
+                got_info = True
+            elif cid == 0x1654AE6B:  # Tracks
+                for tid_, tdata, tstop in children(cdata, cstop):
+                    if tid_ != 0xAE:  # TrackEntry
+                        continue
+                    for vid, vdata, vstop in children(tdata, tstop):
+                        if vid != 0xE0:  # Video
+                            continue
+                        w = h = 0
+                        for pid, pdata, pstop in children(vdata, vstop):
+                            if pid == 0xB0:
+                                w = uint(pdata, pstop)
+                            elif pid == 0xBA:
+                                h = uint(pdata, pstop)
+                        if w * h > out["w"] * out["h"]:
+                            out["w"], out["h"] = w, h
+        return out if got_info else None
     return None
 
 
-def video_duration_seconds(path: Path) -> float | None:
+def video_info(path: Path) -> dict | None:
+    """{"sec", "w", "h"} for MP4/MOV/M4V/MKV/WEBM; None when unreadable (any other format, damage)."""
     try:
         ext = path.suffix.lower()
         if ext not in (".mp4", ".m4v", ".mov", ".mkv", ".webm"):
             return None
         size = path.stat().st_size
         with open(long_path(path), "rb") as f:
-            d = _mp4_duration(f, size) if ext in (".mp4", ".m4v", ".mov") else _mkv_duration(f, size)
-        return d if d and 0 < d < 48 * 3600 else None
+            info = _mp4_info(f, size) if ext in (".mp4", ".m4v", ".mov") else _mkv_info(f, size)
+        if not info or not info.get("sec") or not (0 < info["sec"] < 48 * 3600):
+            return None
+        return info
     except Exception:
         return None
+
+
+def video_duration_seconds(path: Path) -> float | None:
+    info = video_info(path)
+    return info["sec"] if info else None
 
 
 _EDITION_RE = re.compile(
@@ -4955,6 +5236,440 @@ def runtime_fits(duration_min: float, runtime_min: float, edition: bool = False)
     lo = runtime_min * (0.7 if edition else 0.88) - 4
     hi = runtime_min * (2.3 if edition else 1.45) + 10
     return lo <= duration_min <= hi
+
+
+MERGE_SEASONS = True   # on by default; --no-merge-seasons turns it off
+
+
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _cn_int(t: str) -> int | None:
+    t = (t or "").strip()
+    if t.isdigit():
+        return int(t)
+    if t == "十":
+        return 10
+    if t.startswith("十") and len(t) == 2 and t[1] in _CN_DIGITS:
+        return 10 + _CN_DIGITS[t[1]]
+    if len(t) == 2 and t[1] == "十" and t[0] in _CN_DIGITS:
+        return _CN_DIGITS[t[0]] * 10
+    if len(t) == 3 and t[1] == "十" and t[0] in _CN_DIGITS and t[2] in _CN_DIGITS:
+        return _CN_DIGITS[t[0]] * 10 + _CN_DIGITS[t[2]]
+    return _CN_DIGITS.get(t) if len(t) == 1 else None
+
+
+def season_number_from_name(name: str) -> int | None:
+    """One season number from a folder name (S02, Season 2, 第二季); None for none / ranges / specials."""
+    n = name or ""
+    if re.search(r"(?i)S\d{1,2}\s*[-–~]\s*S?\d{1,2}|Seasons?[\s._]*\d{1,2}\s*[-–~]|Complete[\s._]*Series|全\s*[一二三四五六七八九十\d]+\s*季|第\s*[一二三四五六七八九十\d]+\s*[-–~至到]", n):
+        return None
+    found = set()
+    for m in re.finditer(r"(?i)(?<![A-Za-z0-9])S(\d{1,2})(?![0-9])", n):
+        found.add(int(m.group(1)))
+    for m in re.finditer(r"(?i)Season[\s._]*(\d{1,2})(?![0-9])", n):
+        found.add(int(m.group(1)))
+    for m in re.finditer(r"第\s*([零一二三四五六七八九十两\d]+)\s*季", n):
+        v = _cn_int(m.group(1))
+        if v is not None:
+            found.add(v)
+    return found.pop() if len(found) == 1 and 0 not in found else None
+
+
+def season_folder_name(n: int) -> str:
+    return f"Season {n:02d}"
+
+
+def move_into_season(src: Path, dest: Path, season: int) -> None:
+    """Move everything in src (loose episodes) into dest/Season NN, then drop empty src."""
+    sd = dest / season_folder_name(season)
+    merge_folder_into(src, sd)
+
+
+def wrap_into_season(folder: Path, season: int) -> None:
+    """A show folder that holds one season's episodes loose: put them into Season NN inside it."""
+    sd = folder / season_folder_name(season)
+    kids = [c for c in list(folder.iterdir())
+            if c != sd and not (c.is_dir() and is_season_dir_name(c.name))]
+    if not kids:
+        return
+    if not sd.exists():
+        _log_op("mkdir", path=str(sd))
+    sd.mkdir(exist_ok=True)
+    for c in kids:
+        _rename_one(c, _unique_child_path(sd, c.name))
+
+
+def resolve_season_group(prim: dict, others: list) -> tuple[list, list]:
+    """Folders of the same TV show: put each season under one show folder.
+
+    Returns (plan_records, skip_records). A group is only merged when every folder's season
+    can be read from its name (or it already contains Season subfolders) and no two folders
+    claim the same season; otherwise nothing in the group is moved."""
+    group = [prim] + others
+    seasons = []
+    for r in group:
+        p = Path(r["path"])
+        if r.get("kind") == "tv_show":
+            subs = {x.name.lower() for x in p.iterdir() if x.is_dir() and is_season_dir_name(x.name)} if p.exists() else set()
+            seasons.append(("show", subs))
+        else:
+            n = season_number_from_name(r.get("name") or "")
+            seasons.append(("season", n))
+    bad = [i for i, (k, v) in enumerate(seasons) if k == "season" and v is None]
+    claimed: dict = {}
+    clash = False
+    for k, v in seasons:
+        if k == "season" and v is not None:
+            clash |= v in claimed
+            claimed[v] = True
+    if bad or clash:
+        why = "看不出是第几季" if bad else "有两个文件夹是同一季"
+        return [], [{**r, "reason": "season_merge_unclear", "note": f"同一部剧有多个文件夹，但{why}，未合并"} for r in group]
+    plan = []
+    for i, (r, (k, v)) in enumerate(zip(group, seasons)):
+        r = dict(r)
+        if i == 0:
+            r["reason"] = "season_primary"
+            if k == "season":
+                r["season_wrap"] = v
+            plan.append(r)
+        else:
+            r["action"] = "merge_season"
+            r["dest"] = prim["dest"]
+            r["target"] = prim["target"]
+            r["reason"] = "season_merge"
+            if k == "season":
+                r["season_no"] = v
+            plan.append(r)
+    return plan, []
+
+
+_VERSION_EDITIONS = [
+    (r"director'?s?[\s._-]*cut|导演剪辑", "Director's Cut"),
+    (r"extended|加长", "Extended"),
+    (r"uncut|unrated|未删减", "Unrated"),
+    (r"theatrical|院线版|戏院", "Theatrical"),
+    (r"final[\s._-]*cut", "Final Cut"),
+    (r"redux", "Redux"),
+    (r"remaster|重制|修复版", "Remastered"),
+    (r"imax", "IMAX"),
+    (r"special[\s._-]*edition|特别版", "Special Edition"),
+    (r"ultimate|终极版", "Ultimate"),
+]
+_VERSION_SOURCES = [
+    (r"remux", "Remux"),
+    (r"blu[\s._-]?ray|bdrip|brrip|bd25|bd50", "BluRay"),
+    (r"web[\s._-]?dl|webrip", "WEB-DL"),
+    (r"hdtv", "HDTV"),
+    (r"dvdrip|dvd9|dvd5", "DVD"),
+]
+
+
+def version_label(text: str, info: dict | None) -> str:
+    """Edition + resolution + source + HDR for one video, e.g. 'Extended 4K Remux'. '' = nothing notable."""
+    t = text or ""
+    parts = []
+    for pat, lab in _VERSION_EDITIONS:
+        if re.search(pat, t, re.I):
+            parts.append(lab)
+            break
+    res = ""
+    w, h = (info or {}).get("w") or 0, (info or {}).get("h") or 0
+    if w and h:
+        if w >= 3200 or h >= 1900:
+            res = "4K"
+        elif w >= 1800 or h >= 1000:
+            res = "1080p"
+        elif w >= 1200 or h >= 700:
+            res = "720p"
+        else:
+            res = "SD"
+    else:
+        if re.search(r"2160p|(?<![a-z0-9])4k(?![a-z0-9])|uhd", t, re.I):
+            res = "4K"
+        elif re.search(r"1080[pi]", t, re.I):
+            res = "1080p"
+        elif re.search(r"720p", t, re.I):
+            res = "720p"
+        elif re.search(r"480p|576p", t, re.I):
+            res = "SD"
+    if res:
+        parts.append(res)
+    for pat, lab in _VERSION_SOURCES:
+        if re.search(pat, t, re.I):
+            parts.append(lab)
+            break
+    if re.search(r"dolby[\s._-]*vision|(?<![a-z0-9])dovi(?![a-z0-9])|(?<![a-z0-9])dv(?![a-z0-9])", t, re.I):
+        parts.append("DV")
+    elif re.search(r"hdr", t, re.I):
+        parts.append("HDR")
+    return " ".join(parts)
+
+
+def version_profile(folder: Path) -> dict:
+    """The main movie of a folder (largest video, or the multi-part set): size, length, picture size, label."""
+    try:
+        videos = list_videos_in_dir(folder)
+    except Exception:
+        videos = []
+    groups: dict = {}
+    for v in videos:
+        try:
+            sz = v.stat().st_size
+        except Exception:
+            sz = 0
+        groups.setdefault(multipart_base(v.stem), []).append((v, sz))
+    if not groups:
+        return {"videos": [], "size": 0, "sec": None, "w": 0, "h": 0, "label": ""}
+    members = max(groups.values(), key=lambda g: sum(x[1] for x in g))
+    members.sort(key=lambda x: x[0].name.lower())
+    info = None
+    secs = []
+    for v, _sz in members:
+        i = video_info(v)
+        if i:
+            secs.append(i["sec"])
+            if info is None or i["w"] * i["h"] > info["w"] * info["h"]:
+                info = i
+    text = folder.name + " " + " ".join(v.stem for v, _ in members)
+    return {
+        "videos": [v.name for v, _ in members],
+        "size": sum(x[1] for x in members),
+        "sec": sum(secs) if secs else None,
+        "w": (info or {}).get("w") or 0,
+        "h": (info or {}).get("h") or 0,
+        "label": version_label(text, info),
+    }
+
+
+def describe_profile(p: dict) -> str:
+    bits = []
+    if p.get("w") and p.get("h"):
+        bits.append(f"{p['w']}x{p['h']}")
+    if p.get("sec"):
+        bits.append(f"{round(p['sec'] / 60)}分钟")
+    if p.get("size"):
+        bits.append(f"{p['size'] / 1024 ** 3:.2f}GB" if p["size"] >= 1024 ** 3 else f"{p['size'] / 1024 ** 2:.0f}MB")
+    return " ".join(bits) or "无法读取"
+
+
+def decide_duplicate_group(group: list) -> tuple[str, list]:
+    """group: records of folders that all claim the same movie folder name.
+
+    Returns ("versions", labels) when every folder is a different version (labels are
+    unique), else ("duplicate", labels): at least two look identical, the user decides."""
+    profs = [version_profile(Path(r["path"])) for r in group]
+    labels = [p["label"] for p in profs]
+    for i, r in enumerate(group):
+        r["version_profile"] = profs[i]
+    # same label but clearly different length (another cut) → tell them apart by minutes
+    for lab in set(labels):
+        idx = [i for i, x in enumerate(labels) if x == lab]
+        if len(idx) < 2:
+            continue
+        secs = [profs[i]["sec"] for i in idx]
+        if all(secs) and max(secs) > min(secs) * 1.06:
+            for i in idx:
+                labels[i] = (lab + " " if lab else "") + f"{round(profs[i]['sec'] / 60)}min"
+    unique = len(set(labels)) == len(labels) and all(p["videos"] for p in profs)
+    return ("versions" if unique else "duplicate"), labels
+
+
+def apply_version_names(folder: Path, base: str, label: str, video_names: list) -> None:
+    """Rename a folder's main video (and its subtitles / nfo) to '<base> - <label>.ext'."""
+    if not label or not video_names:
+        return
+    for i, vn in enumerate(sorted(video_names), 1):
+        v = folder / vn
+        if not v.exists():
+            continue
+        stem = f"{base} - {label}" + (f" - part{i}" if len(video_names) > 1 else "")
+        if v.stem == stem:
+            continue
+        sides = sidecar_files(v)
+        old_stem = v.stem
+        dst = folder / (stem + v.suffix)
+        if dst.exists():
+            continue
+        _rename_one(v, dst)
+        for sc in sides:
+            sdst = folder / (stem + sc.name[len(old_stem):])
+            if sc.exists() and not sdst.exists():
+                _rename_one(sc, sdst)
+
+
+def lang_title(meta: dict, mode: str):
+    """The title in the requested language, or None when TMDB has none (caller keeps the default)."""
+    if mode == "original":
+        return (meta.get("original_title") or "").strip() or None
+    if mode == "en":
+        return (meta.get("title_enus") or "").strip() or None
+    if mode == "zh-TW":
+        t = (meta.get("title_twr") or "").strip()
+        return t if readable_han_title(t) else None
+    return None
+
+
+def prefetch_title_lang(leaves: list, cache: dict) -> None:
+    """Fetch the English / Traditional-Chinese titles that the chosen language needs (cached in meta)."""
+    mode = TITLE_LANG
+    if mode not in ("en", "zh-TW"):
+        return
+    field, lang = ("title_enus", "en-US") if mode == "en" else ("title_twr", "zh-TW")
+    todo = {}
+    for L in leaves:
+        if not L.get("tmdb"):
+            continue
+        kind = L.get("media") if L.get("media") in ("movie", "tv") else ("tv" if media_is_tv() else "movie")
+        meta = cache.get(ckey(L["tmdb"], kind))
+        if isinstance(meta, dict) and meta.get("ok") and field not in meta:
+            todo[(str(L["tmdb"]), kind)] = meta
+
+    def one(item):
+        (tid, kind), meta = item
+        d = api_get(f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}&language={lang}")
+        t = ""
+        if isinstance(d, dict) and not d.get("_error"):
+            t = (d.get("title") or d.get("name") or "").strip()
+        meta[field] = t
+        return None
+
+    list(_pmap(one, list(todo.items())))
+
+
+def tv_counts(tid: str, cache: dict) -> dict | None:
+    """{"seasons": n, "episodes": n, "per": {season: episodes}} of a TMDB show (cached 14 days)."""
+    ck = f"tvc:{tid}"
+    c = cache.get(ck)
+    if isinstance(c, dict) and time.time() - c.get("ts", 0) < 14 * 86400 and c.get("per") is not None:
+        return c
+    d = api_get(f"https://api.themoviedb.org/3/tv/{tid}?api_key={API_KEY}&language=zh-CN")
+    if not isinstance(d, dict) or d.get("_error"):
+        return None
+    per = {}
+    for se in d.get("seasons") or []:
+        if isinstance(se, dict) and se.get("season_number") is not None:
+            per[str(se["season_number"])] = int(se.get("episode_count") or 0)
+    out = {
+        "ts": time.time(),
+        "seasons": int(d.get("number_of_seasons") or len([k for k in per if k != "0"])),
+        "episodes": int(d.get("number_of_episodes") or 0),
+        "per": per,
+    }
+    cache[ck] = out
+    return out
+
+
+_EP_SEASON_RE = re.compile(r"(?i)(?<![A-Za-z0-9])S(\d{1,2})[\s._]*E\d{1,3}")
+
+
+def local_season_counts(folder: Path) -> dict:
+    """{season_no: episode_file_count} of the video files under a show folder (extras skipped)."""
+    out: dict = {}
+    stack = [(folder, None)]
+    seen = 0
+    while stack and seen < 5000:
+        d, dir_season = stack.pop()
+        for n, isd, isf in _entries(d):
+            if isd:
+                if should_prune(n) or is_extras_dir(n) or n.lower() in DISC_DIR_NAMES:
+                    continue
+                sn = season_number_from_name(n) if is_season_dir_name(n) else None
+                stack.append((d / n, sn if sn is not None else dir_season))
+            elif isf and Path(n).suffix.lower() in VIDEO:
+                seen += 1
+                m = _EP_SEASON_RE.search(n)
+                sn = int(m.group(1)) if m else dir_season
+                if sn is not None:
+                    out[sn] = out.get(sn, 0) + 1
+    return out
+
+
+def check_tv_episodes(leaves: list, cache: dict) -> tuple[list, list]:
+    """Cross-check TV leaves with TMDB's season / episode counts. Returns (kept, flagged).
+
+    More seasons (or clearly more episodes in a season) on disk than the matched show has is
+    impossible; if another show with the same title does fit, the leaf is listed as uncertain.
+    Fewer than TMDB lists is normal (partial libraries) and never flagged."""
+    kept, flagged = [], []
+
+    def fits(counts, loc):
+        if not counts:
+            return True
+        for sn, n in loc.items():
+            if sn == 0:
+                continue
+            if sn > counts["seasons"]:
+                return False
+            per = counts["per"].get(str(sn))
+            if per and n > per * 1.3 + 3:
+                return False
+        return True
+
+    def one(L):
+        media = L.get("media") or ("tv" if media_is_tv() else "movie")
+        if media != "tv" or not L.get("tmdb") or L.get("id_from") == "user_choice":
+            return L, None
+        loc = local_season_counts(Path(L["path"]))
+        if not loc:
+            return L, None
+        tid = str(L["tmdb"])
+        counts = tv_counts(tid, cache)
+        if not counts:
+            return L, None
+        if fits(counts, loc):
+            L["episode_check"] = "ok"
+            return L, None
+        name = L.get("name") or ""
+        q = L.get("search_query") or clean_query_title(strip_season_tokens(name))
+        try:
+            found = _search_tmdb_one_kind("tv", q, None)
+        except Exception:
+            found = []
+        pool = [(t2, r) for (_sc, t2, r) in found if str(t2) != tid and isinstance(r, dict) and _title_similarity(q, r) >= 1.0]
+        rivals, fit = [], []
+        for t2, r in pool[:5]:
+            c2 = tv_counts(str(t2), cache)
+            cand = {
+                "media": "tv", "tmdb": str(t2), "title": r.get("name") or r.get("title") or "",
+                "original": r.get("original_name") or "", "year": str(r.get("first_air_date") or "")[:4],
+                "country": "", "lang": r.get("original_language") or "",
+                "seasons": c2["seasons"] if c2 else None,
+            }
+            rivals.append(cand)
+            if c2 and fits(c2, loc):
+                fit.append(cand)
+        meta = cache.get(ckey(tid, "tv")) or {}
+        own = {
+            "media": "tv", "tmdb": tid, "title": meta.get("picked_title") or "", "original": meta.get("original_title") or "",
+            "year": str(meta.get("year") or "")[:4], "country": "", "lang": "", "seasons": counts["seasons"],
+        }
+        have = "、".join(f"第{k}季{v}集" for k, v in sorted(loc.items()))
+        L["episode_check"] = "mismatch"
+        if fit:
+            best = fit[0]
+            note = (f"文件夹里有 {have}，超出所选《{own['title']}》（共{counts['seasons']}季）的范围，"
+                    f"但《{best['title']}》({best['year']}，{best['seasons']}季) 吻合")
+            return L, {"note": note, "candidates": [own] + fit + [c for c in rivals if c not in fit]}
+        L["episode_note"] = f"文件夹里有 {have}，但 TMDB 只有 {counts['seasons']} 季（可能是分季编号不同）"
+        return L, None
+
+    for L, flag in _pmap(one, leaves):
+        if flag and not ACCEPT_UNCERTAIN:
+            L2 = dict(L)
+            L2.pop("tmdb", None)
+            L2.update({
+                "id_from": "uncertain_title_only",
+                "reason": "uncertain_title_only",
+                "note": flag["note"] + (" | " + candidates_note(flag["candidates"], 4) if flag["candidates"] else ""),
+                "candidates": flag["candidates"],
+                "candidate_tmdb": str(L.get("tmdb")),
+            })
+            flagged.append(L2)
+        else:
+            kept.append(L)
+    return kept, flagged
 
 
 def check_movie_durations(leaves: list, cache: dict) -> tuple[list, list]:
@@ -5061,11 +5776,30 @@ def main():
     SEARCH_CACHE_PATH = TOOLS / "tmdb_search_cache.json"
     API_KEY = _load_api_key()
     args = [a for a in sys.argv[1:] if a]
+    if "--undo" in args:
+        return 1 if undo_last_run() else 0
+    with _CHANGE_LOCK:
+        CHANGE_LOG.clear()
+    _RUN_STAMP[0] = None
     preview = "--preview" in args or "-n" in args
     no_poster = "--no-poster" in args
     no_nfo = "--no-nfo" in args
     preview_nfo = "--preview-nfo" in args
     only_new = "--only-new" in args
+    global MERGE_SEASONS, NAME_TEMPLATE, TITLE_LANG
+    MERGE_SEASONS = "--no-merge-seasons" not in args
+    TITLE_LANG = "auto"
+    NAME_TEMPLATE = ""
+    for a in args:
+        if a.startswith("--title-lang="):
+            v = a.split("=", 1)[1].strip()
+            TITLE_LANG = v if v in ("auto", "zh-TW", "en") else "auto"
+        elif a.startswith("--name-template="):
+            v = a.split("=", 1)[1].strip().strip('"')
+            if valid_template(v):
+                NAME_TEMPLATE = v if v != DEFAULT_TEMPLATE else ""
+            else:
+                print(f"命名格式无效（只支持 {{title}} ({{year}}) [tmdbid={{tid}}] 或 {{original}} ({{year}}) [tmdbid={{tid}}]），已改用默认格式：{v}", flush=True)
     global ACCEPT_UNCERTAIN
     ACCEPT_UNCERTAIN = "--accept-uncertain" in args
     media = "auto"
@@ -5083,8 +5817,10 @@ def main():
     args = [
         a
         for a in args
-        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--accept-uncertain", "--tv", "--media=tv", "--media=movie", "--media=auto")
+        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--accept-uncertain", "--no-merge-seasons", "--tv", "--media=tv", "--media=movie", "--media=auto")
         and not a.startswith("--media=")
+        and not a.startswith("--title-lang=")
+        and not a.startswith("--name-template=")
     ]
     if not args:
         root = Path(os.environ.get("TMDB_RENAME_ROOT") or os.getcwd())
@@ -5166,6 +5902,8 @@ def main():
     print("正在整理散落的视频（预览时只显示计划）...", flush=True)
     wrapped = wrap_loose_videos(root, preview=preview)
     print(f"  散落视频整理数 = {len(wrapped)}", flush=True)
+    if not preview:
+        save_history(root)
 
     print("正在扫描剧集文件夹..." if media_is_tv() else "正在扫描电影文件夹...", flush=True)
     tagged, untagged = collect_candidate_dirs(root)
@@ -5298,12 +6036,25 @@ def main():
         unresolved.extend(dur_flagged)
         save_json(CACHE_PATH, cache)
 
+    # TV: do the seasons / episodes on disk fit the show we matched?
+    leaves, ep_flagged = check_tv_episodes(leaves, cache)
+    for L in leaves:
+        if L.get("episode_note"):
+            print(f"  集数提示: {(L.get('name') or '')[:60]} | {L['episode_note']}", flush=True)
+    for L in ep_flagged:
+        print(f"  集数对不上: {(L.get('name') or '')[:60]} | {L.get('note')}", flush=True)
+    unresolved.extend(ep_flagged)
+    save_json(CACHE_PATH, cache)
+
     # Multi-disc sibling folders (D1/D2…) sharing parent+tmdb → one folder
     leaves, multidisc_skips = collapse_multidisc_leaves(leaves, root)
     plan, skip = [], []
     skip.extend(multidisc_skips)
     multidisc_dest_by_primary = {}
+    prefetch_title_lang(leaves, cache)
+    save_json(CACHE_PATH, cache)
     used = {}
+    dupgroups: dict = {}
     for L in leaves:
         tid = L["tmdb"]
         meta = cache.get(ckey(tid, _leaf_kind(L))) or {}
@@ -5311,6 +6062,10 @@ def main():
         if meta.get("ok") and meta.get("picked_title"):
             title, year, lang = picked_title_from_cache(meta)
             source = "tmdb"
+            if TITLE_LANG != "auto":
+                alt = lang_title(meta, TITLE_LANG)
+                if alt:
+                    title, lang = alt, TITLE_LANG
         if not title:
             nfo = find_nfo_meta(Path(L["path"]))
             t = (nfo.get("title") or nfo.get("originaltitle") or "").strip()
@@ -5322,7 +6077,11 @@ def main():
             continue
         parent = L["parent"]
         try:
-            target = fit_folder_name(title, year, tid, Path(parent))
+            target = fit_folder_name(
+                title, year, tid, Path(parent),
+                original=(meta.get("original_title") or ""),
+                edition=edition_of(L["name"] + " " + " ".join(_leaf_video_stems(Path(L["path"]), 4))),
+            )
         except Exception:
             target = build_name(title, year, tid)
         key = (parent.lower(), target.lower())
@@ -5350,6 +6109,18 @@ def main():
                         break
                 else:
                     multidisc_dest_by_primary[prev_path] = dest
+                continue
+            if not media_is_tv():
+                dupgroups.setdefault(key, [prev_path]).append({
+                    **L, "target": target, "dest": dest, "title": title,
+                    "year": year, "lang": lang, "source": source,
+                })
+                continue
+            if media_is_tv() and MERGE_SEASONS:
+                dupgroups.setdefault(key, [prev_path]).append({
+                    **L, "target": target, "dest": dest, "title": title,
+                    "year": year, "lang": lang, "source": source,
+                })
                 continue
             n = 2
             while key in used and n <= 30:
@@ -5393,6 +6164,49 @@ def main():
                 skip.append({**rec, "reason": "dest_exists"})
                 continue
         plan.append(rec)
+
+    # Several folders for the same movie: different versions → one folder, labelled files;
+    # identical-looking ones → reported as duplicates, nothing touched.
+    for gkey, members in dupgroups.items():
+        prim_path = members[0]
+        prim = None
+        for lst in (plan, skip):
+            for r in lst:
+                if r.get("path") == prim_path and r.get("reason") in (None, "already_ok", "flatten_discs_only"):
+                    prim = r
+                    lst.remove(r)
+                    break
+            if prim:
+                break
+        if prim is None:
+            prim = next((r for r in skip if r.get("path") == prim_path), None)
+            for m in members[1:]:
+                skip.append({**m, "reason": "dest_exists"})
+            continue
+        if media_is_tv():
+            p_recs, s_recs = resolve_season_group(prim, members[1:])
+            plan.extend(p_recs)
+            skip.extend(s_recs)
+            continue
+        group = [prim] + members[1:]
+        verdict, labels = decide_duplicate_group(group)
+        base = re.sub(r"\s*\[tmdbid=\d+\]\s*$", "", prim["target"])
+        if verdict == "versions":
+            for r, lab in zip(group, labels):
+                r["version_label"] = lab
+                r["version_videos"] = list(r["version_profile"]["videos"])
+                r["version_base"] = base
+                r["version_info"] = describe_profile(r["version_profile"])
+            prim["reason"] = "version_primary"
+            plan.append(prim)
+            for r in group[1:]:
+                plan.append({**r, "action": "merge_version", "dest": prim["dest"],
+                             "target": prim["target"], "reason": "version_merge"})
+        else:
+            summary = "；".join(f"{Path(r['path']).name} → {describe_profile(r['version_profile'])}"
+                               for r in group)
+            for r in group:
+                skip.append({**r, "reason": "duplicate_movie", "note": "重复：" + summary})
 
     # Promote multidisc merge skips into plan so apply actually moves them
     primary_dest = {p.get("path"): p.get("dest") for p in plan if p.get("dest")}
@@ -5502,6 +6316,10 @@ def main():
         "media": MEDIA_KIND,
     }
     save_exists_cache()
+    if not preview:
+        save_history(root)
+        if CHANGE_LOG:
+            print(f"改动已记录，可以用「撤销上次改名」还原（{len(CHANGE_LOG)} 步）。", flush=True)
     log_path = TOOLS / "tmdb_format_rename_last.json"
     log_path.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"详细日志文件: {log_path}", flush=True)
@@ -5514,6 +6332,7 @@ def main():
     else:
         print(f"开始正式改名，共 {len(plan)} 个文件夹...", flush=True)
         ok, fail = apply_renames(plan)
+        save_history(root)
         apply_path = TOOLS / "tmdb_format_rename_apply.json"
         apply_path.write_text(
             json.dumps(
@@ -5626,6 +6445,8 @@ def main():
     print("  · 找不到TMDB编号 = 名称太乱或是剧集/合集盘，未能自动匹配", flush=True)
     print("  · 多个候选且无年份 = 搜到多部同名/相近片，文件夹没写年份，已跳过不猜", flush=True)
     print("  · 已有跳过 = 封面等文件已存在，不会重复下载", flush=True)
+    if not preview:
+        save_history(root)
     return 0 if not fail else 1
 
 
