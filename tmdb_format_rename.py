@@ -43,9 +43,12 @@ from pathlib import Path
 
 def _app_dir() -> Path:
     """Folder of the exe or this script. Not the PyInstaller temp extract."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    me = Path(sys.executable if getattr(sys, "frozen", False) else __file__)
+    try:
+        return me.resolve().parent
+    except OSError:
+        # e.g. the exe sits on a network / NAS drive Windows cannot resolve (WinError 1005)
+        return Path(os.path.abspath(me)).parent
 
 
 def _roaming_dir() -> Path:

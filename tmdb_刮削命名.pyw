@@ -14,9 +14,12 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
 def app_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    me = Path(sys.executable if getattr(sys, "frozen", False) else __file__)
+    try:
+        return me.resolve().parent
+    except OSError:
+        # e.g. the exe sits on a network / NAS drive Windows cannot resolve (WinError 1005)
+        return Path(os.path.abspath(me)).parent
 
 
 def find_tools_dir() -> Path:
