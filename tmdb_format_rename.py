@@ -4808,7 +4808,7 @@ def _zh_reason(code: str) -> str:
         "search_error": "搜索失败",
         "empty_query": "标题为空",
         "uncertain_title_only": "不确定：需要确认（未改名）",
-        "duplicate_movie": "重复影片（请决定保留哪个）",
+        "duplicate_movie": "重复影片（未改动，请自行决定保留哪个）",
         "season_merge_unclear": "同一部剧的多个文件夹无法合并（请确认）",
     }.get(code or "", code or "?")
 
@@ -5452,6 +5452,16 @@ def _is_tv_leaf(L: dict) -> bool:
     return L.get("media") == "tv" or (media_is_tv() and L.get("media") != "movie")
 
 
+def _looks_like_season_folder(L: dict) -> bool:
+    """S01 / 第一季 in the folder name, or episode files (S01E02, 第3集) inside."""
+    if _SEASON_TOKENS.search(L.get("name") or ""):
+        return True
+    try:
+        return any(looks_like_episode_file(st) for st in _leaf_video_stems(Path(L["path"]), 6))
+    except Exception:
+        return False
+
+
 def tv_counts(tid: str, cache: dict) -> dict | None:
     """{"seasons": n, "episodes": n, "per": {season: episodes}} of a TMDB show (cached 14 days)."""
     ck = f"tvc:{tid}"
@@ -6067,6 +6077,12 @@ def main():
             skip.extend(s_recs)
             continue
         group = [prim] + members[1:]
+        if any(_looks_like_season_folder(r) for r in group):
+            # Seasons of a show are never duplicates of each other, whatever they matched.
+            for r in group:
+                skip.append({**r, "reason": "season_merge_unclear",
+                             "note": "像同一部剧的分季文件夹，但匹配到的是电影，未改动；请确认类型"})
+            continue
         verdict, labels = decide_duplicate_group(group)
         base = re.sub(r"\s*\[tmdbid=\d+\]\s*$", "", prim["target"])
         if verdict == "versions":

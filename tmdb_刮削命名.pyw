@@ -149,7 +149,7 @@ REASON_ZH = {
     "ambiguous_movie_and_tv": "电影和剧集都匹配到了（请确认）",
     "search_error": "搜索出错",
     "uncertain_title_only": "不确定：需要确认（未改名）",
-    "duplicate_movie": "重复影片（请决定保留哪个）",
+    "duplicate_movie": "重复影片（未改动，请自行决定保留哪个）",
     "season_merge_unclear": "同一部剧的多个文件夹无法合并（请确认）",
     "empty_query": "查询为空",
     "no_usable_title": "没有可用标题",
