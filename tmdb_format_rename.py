@@ -4632,7 +4632,7 @@ def apply_renames(plan):
     ok, fail = [], []
     ordered = sorted(
         plan,
-        key=lambda r: 1 if (r.get("action") == "merge_into") else 0,
+        key=lambda r: 1 if (r.get("action") in ("merge_into", "merge_version")) else 0,
     )
 
     def _maybe_flatten(rec, dest: Path):
@@ -4661,6 +4661,14 @@ def apply_renames(plan):
                     dest = src if src.exists() else dest
                 flat = flatten_disc_subfolders(dest if dest.exists() else src)
                 ok.append({**rec, "final": str(dest if dest.exists() else src), "note": "flattened", "flattened": len(flat)})
+            elif action == "merge_version":
+                if not src.exists():
+                    fail.append({**rec, "error": "source_missing"})
+                else:
+                    apply_version_names(src, rec.get("version_base") or dest.name,
+                                        rec.get("version_label") or "", rec.get("version_videos") or [])
+                    merge_folder_into(src, dest)
+                    ok.append({**rec, "final": str(dest), "note": "version_merged"})
             elif action == "merge_into":
                 if not src.exists():
                     ok.append({**rec, "final": str(dest), "note": "merge_src_missing"})
@@ -4693,6 +4701,9 @@ def apply_renames(plan):
                 else:
                     if str(src) != str(dest):
                         _rename_one(src, dest)
+                    if rec.get("version_label"):
+                        apply_version_names(dest, rec.get("version_base") or dest.name,
+                                            rec["version_label"], rec.get("version_videos") or [])
                     flat = _maybe_flatten(rec, dest)
                     ok.append({**rec, "final": str(dest), "flattened": len(flat)})
         except Exception as e:
@@ -4794,6 +4805,7 @@ def _zh_reason(code: str) -> str:
         "search_error": "搜索失败",
         "empty_query": "标题为空",
         "uncertain_title_only": "不确定：需要确认（未改名）",
+        "duplicate_movie": "重复影片（请决定保留哪个）",
     }.get(code or "", code or "?")
 
 
@@ -4977,7 +4989,8 @@ def stamp_item_media(item: dict) -> dict:
 # MP4/MOV/M4V (mvhd) and MKV/WEBM (Info/Duration). Anything else, or any
 # error, gives None and the check is simply skipped.
 # ---------------------------------------------------------------------------
-def _mp4_duration(f, size: int) -> float | None:
+def _mp4_info(f, size: int) -> dict | None:
+    """{"sec", "w", "h"} from an MP4/MOV: mvhd for the length, the widest tkhd for the picture size."""
     def walk(start: int, end: int, want: bytes):
         pos = start
         while pos + 8 <= end:
@@ -5000,18 +5013,31 @@ def _mp4_duration(f, size: int) -> float | None:
             pos += bsize
 
     for m_start, m_end in walk(0, size, b"moov"):
+        out = {"sec": None, "w": 0, "h": 0}
         for h_start, _h_end in walk(m_start, m_end, b"mvhd"):
             f.seek(h_start)
             body = f.read(32)
-            if len(body) < 20:
-                return None
-            if body[0] == 1 and len(body) >= 32:
-                timescale = int.from_bytes(body[20:24], "big")
-                dur = int.from_bytes(body[24:32], "big")
-            else:
-                timescale = int.from_bytes(body[12:16], "big")
-                dur = int.from_bytes(body[16:20], "big")
-            return dur / timescale if timescale else None
+            if len(body) >= 20:
+                if body[0] == 1 and len(body) >= 32:
+                    timescale = int.from_bytes(body[20:24], "big")
+                    dur = int.from_bytes(body[24:32], "big")
+                else:
+                    timescale = int.from_bytes(body[12:16], "big")
+                    dur = int.from_bytes(body[16:20], "big")
+                out["sec"] = dur / timescale if timescale else None
+            break
+        for t_start, t_end in walk(m_start, m_end, b"trak"):
+            for k_start, _k_end in walk(t_start, t_end, b"tkhd"):
+                f.seek(k_start)
+                body = f.read(96)
+                off = 88 if (body[:1] == b"\x01") else 76
+                if len(body) >= off + 8:
+                    w = int.from_bytes(body[off:off + 4], "big") >> 16
+                    h = int.from_bytes(body[off + 4:off + 8], "big") >> 16
+                    if w * h > out["w"] * out["h"]:
+                        out["w"], out["h"] = w, h
+                break
+        return out
     return None
 
 
@@ -5037,7 +5063,10 @@ def _ebml_vint(f, keep_marker: bool):
     return (None if unknown else val), length
 
 
-def _mkv_duration(f, size: int) -> float | None:
+def _mkv_info(f, size: int) -> dict | None:
+    """{"sec", "w", "h"} from an MKV/WEBM: Info/Duration and the video track's pixel size."""
+    import struct
+
     def children(start: int, end: int):
         pos = start
         for _ in range(4000):
@@ -5055,38 +5084,67 @@ def _mkv_duration(f, size: int) -> float | None:
                 return
             pos = stop
 
+    def uint(data: int, stop: int) -> int:
+        f.seek(data)
+        return int.from_bytes(f.read(stop - data), "big")
+
     for eid, data, stop in children(0, size):
         if eid != 0x18538067:  # Segment
             continue
+        out = {"sec": None, "w": 0, "h": 0}
+        got_info = False
         for cid, cdata, cstop in children(data, stop):
-            if cid == 0x1F43B675:  # Cluster before Info: not a normal file
-                return None
-            if cid != 0x1549A966:  # Info
-                continue
-            scale, dur = 1000000, None
-            for iid, idata, istop in children(cdata, cstop):
-                f.seek(idata)
-                raw = f.read(istop - idata)
-                if iid == 0x2AD7B1:
-                    scale = int.from_bytes(raw, "big") or 1000000
-                elif iid == 0x4489 and len(raw) in (4, 8):
-                    import struct
-                    dur = struct.unpack(">f" if len(raw) == 4 else ">d", raw)[0]
-            return dur * scale / 1e9 if dur else None
+            if cid == 0x1F43B675:  # first Cluster: header part is over
+                break
+            if cid == 0x1549A966:  # Info
+                scale, dur = 1000000, None
+                for iid, idata, istop in children(cdata, cstop):
+                    f.seek(idata)
+                    raw = f.read(istop - idata)
+                    if iid == 0x2AD7B1:
+                        scale = int.from_bytes(raw, "big") or 1000000
+                    elif iid == 0x4489 and len(raw) in (4, 8):
+                        dur = struct.unpack(">f" if len(raw) == 4 else ">d", raw)[0]
+                out["sec"] = dur * scale / 1e9 if dur else None
+                got_info = True
+            elif cid == 0x1654AE6B:  # Tracks
+                for tid_, tdata, tstop in children(cdata, cstop):
+                    if tid_ != 0xAE:  # TrackEntry
+                        continue
+                    for vid, vdata, vstop in children(tdata, tstop):
+                        if vid != 0xE0:  # Video
+                            continue
+                        w = h = 0
+                        for pid, pdata, pstop in children(vdata, vstop):
+                            if pid == 0xB0:
+                                w = uint(pdata, pstop)
+                            elif pid == 0xBA:
+                                h = uint(pdata, pstop)
+                        if w * h > out["w"] * out["h"]:
+                            out["w"], out["h"] = w, h
+        return out if got_info else None
     return None
 
 
-def video_duration_seconds(path: Path) -> float | None:
+def video_info(path: Path) -> dict | None:
+    """{"sec", "w", "h"} for MP4/MOV/M4V/MKV/WEBM; None when unreadable (any other format, damage)."""
     try:
         ext = path.suffix.lower()
         if ext not in (".mp4", ".m4v", ".mov", ".mkv", ".webm"):
             return None
         size = path.stat().st_size
         with open(long_path(path), "rb") as f:
-            d = _mp4_duration(f, size) if ext in (".mp4", ".m4v", ".mov") else _mkv_duration(f, size)
-        return d if d and 0 < d < 48 * 3600 else None
+            info = _mp4_info(f, size) if ext in (".mp4", ".m4v", ".mov") else _mkv_info(f, size)
+        if not info or not info.get("sec") or not (0 < info["sec"] < 48 * 3600):
+            return None
+        return info
     except Exception:
         return None
+
+
+def video_duration_seconds(path: Path) -> float | None:
+    info = video_info(path)
+    return info["sec"] if info else None
 
 
 _EDITION_RE = re.compile(
@@ -5122,6 +5180,160 @@ def runtime_fits(duration_min: float, runtime_min: float, edition: bool = False)
     lo = runtime_min * (0.7 if edition else 0.88) - 4
     hi = runtime_min * (2.3 if edition else 1.45) + 10
     return lo <= duration_min <= hi
+
+
+_VERSION_EDITIONS = [
+    (r"director'?s?[\s._-]*cut|导演剪辑", "Director's Cut"),
+    (r"extended|加长", "Extended"),
+    (r"uncut|unrated|未删减", "Unrated"),
+    (r"theatrical|院线版|戏院", "Theatrical"),
+    (r"final[\s._-]*cut", "Final Cut"),
+    (r"redux", "Redux"),
+    (r"remaster|重制|修复版", "Remastered"),
+    (r"imax", "IMAX"),
+    (r"special[\s._-]*edition|特别版", "Special Edition"),
+    (r"ultimate|终极版", "Ultimate"),
+]
+_VERSION_SOURCES = [
+    (r"remux", "Remux"),
+    (r"blu[\s._-]?ray|bdrip|brrip|bd25|bd50", "BluRay"),
+    (r"web[\s._-]?dl|webrip", "WEB-DL"),
+    (r"hdtv", "HDTV"),
+    (r"dvdrip|dvd9|dvd5", "DVD"),
+]
+
+
+def version_label(text: str, info: dict | None) -> str:
+    """Edition + resolution + source + HDR for one video, e.g. 'Extended 4K Remux'. '' = nothing notable."""
+    t = text or ""
+    parts = []
+    for pat, lab in _VERSION_EDITIONS:
+        if re.search(pat, t, re.I):
+            parts.append(lab)
+            break
+    res = ""
+    w, h = (info or {}).get("w") or 0, (info or {}).get("h") or 0
+    if w and h:
+        if w >= 3200 or h >= 1900:
+            res = "4K"
+        elif w >= 1800 or h >= 1000:
+            res = "1080p"
+        elif w >= 1200 or h >= 700:
+            res = "720p"
+        else:
+            res = "SD"
+    else:
+        if re.search(r"2160p|(?<![a-z0-9])4k(?![a-z0-9])|uhd", t, re.I):
+            res = "4K"
+        elif re.search(r"1080[pi]", t, re.I):
+            res = "1080p"
+        elif re.search(r"720p", t, re.I):
+            res = "720p"
+        elif re.search(r"480p|576p", t, re.I):
+            res = "SD"
+    if res:
+        parts.append(res)
+    for pat, lab in _VERSION_SOURCES:
+        if re.search(pat, t, re.I):
+            parts.append(lab)
+            break
+    if re.search(r"dolby[\s._-]*vision|(?<![a-z0-9])dovi(?![a-z0-9])|(?<![a-z0-9])dv(?![a-z0-9])", t, re.I):
+        parts.append("DV")
+    elif re.search(r"hdr", t, re.I):
+        parts.append("HDR")
+    return " ".join(parts)
+
+
+def version_profile(folder: Path) -> dict:
+    """The main movie of a folder (largest video, or the multi-part set): size, length, picture size, label."""
+    try:
+        videos = list_videos_in_dir(folder)
+    except Exception:
+        videos = []
+    groups: dict = {}
+    for v in videos:
+        try:
+            sz = v.stat().st_size
+        except Exception:
+            sz = 0
+        groups.setdefault(multipart_base(v.stem), []).append((v, sz))
+    if not groups:
+        return {"videos": [], "size": 0, "sec": None, "w": 0, "h": 0, "label": ""}
+    members = max(groups.values(), key=lambda g: sum(x[1] for x in g))
+    members.sort(key=lambda x: x[0].name.lower())
+    info = None
+    secs = []
+    for v, _sz in members:
+        i = video_info(v)
+        if i:
+            secs.append(i["sec"])
+            if info is None or i["w"] * i["h"] > info["w"] * info["h"]:
+                info = i
+    text = folder.name + " " + " ".join(v.stem for v, _ in members)
+    return {
+        "videos": [v.name for v, _ in members],
+        "size": sum(x[1] for x in members),
+        "sec": sum(secs) if secs else None,
+        "w": (info or {}).get("w") or 0,
+        "h": (info or {}).get("h") or 0,
+        "label": version_label(text, info),
+    }
+
+
+def describe_profile(p: dict) -> str:
+    bits = []
+    if p.get("w") and p.get("h"):
+        bits.append(f"{p['w']}x{p['h']}")
+    if p.get("sec"):
+        bits.append(f"{round(p['sec'] / 60)}分钟")
+    if p.get("size"):
+        bits.append(f"{p['size'] / 1024 ** 3:.2f}GB" if p["size"] >= 1024 ** 3 else f"{p['size'] / 1024 ** 2:.0f}MB")
+    return " ".join(bits) or "无法读取"
+
+
+def decide_duplicate_group(group: list) -> tuple[str, list]:
+    """group: records of folders that all claim the same movie folder name.
+
+    Returns ("versions", labels) when every folder is a different version (labels are
+    unique), else ("duplicate", labels): at least two look identical, the user decides."""
+    profs = [version_profile(Path(r["path"])) for r in group]
+    labels = [p["label"] for p in profs]
+    for i, r in enumerate(group):
+        r["version_profile"] = profs[i]
+    # same label but clearly different length (another cut) → tell them apart by minutes
+    for lab in set(labels):
+        idx = [i for i, x in enumerate(labels) if x == lab]
+        if len(idx) < 2:
+            continue
+        secs = [profs[i]["sec"] for i in idx]
+        if all(secs) and max(secs) > min(secs) * 1.06:
+            for i in idx:
+                labels[i] = (lab + " " if lab else "") + f"{round(profs[i]['sec'] / 60)}min"
+    unique = len(set(labels)) == len(labels) and all(p["videos"] for p in profs)
+    return ("versions" if unique else "duplicate"), labels
+
+
+def apply_version_names(folder: Path, base: str, label: str, video_names: list) -> None:
+    """Rename a folder's main video (and its subtitles / nfo) to '<base> - <label>.ext'."""
+    if not label or not video_names:
+        return
+    for i, vn in enumerate(sorted(video_names), 1):
+        v = folder / vn
+        if not v.exists():
+            continue
+        stem = f"{base} - {label}" + (f" - part{i}" if len(video_names) > 1 else "")
+        if v.stem == stem:
+            continue
+        sides = sidecar_files(v)
+        old_stem = v.stem
+        dst = folder / (stem + v.suffix)
+        if dst.exists():
+            continue
+        _rename_one(v, dst)
+        for sc in sides:
+            sdst = folder / (stem + sc.name[len(old_stem):])
+            if sc.exists() and not sdst.exists():
+                _rename_one(sc, sdst)
 
 
 def check_movie_durations(leaves: list, cache: dict) -> tuple[list, list]:
@@ -5478,6 +5690,7 @@ def main():
     skip.extend(multidisc_skips)
     multidisc_dest_by_primary = {}
     used = {}
+    dupgroups: dict = {}
     for L in leaves:
         tid = L["tmdb"]
         meta = cache.get(ckey(tid, _leaf_kind(L))) or {}
@@ -5525,6 +5738,12 @@ def main():
                 else:
                     multidisc_dest_by_primary[prev_path] = dest
                 continue
+            if not media_is_tv():
+                dupgroups.setdefault(key, [prev_path]).append({
+                    **L, "target": target, "dest": dest, "title": title,
+                    "year": year, "lang": lang, "source": source,
+                })
+                continue
             n = 2
             while key in used and n <= 30:
                 try:
@@ -5567,6 +5786,44 @@ def main():
                 skip.append({**rec, "reason": "dest_exists"})
                 continue
         plan.append(rec)
+
+    # Several folders for the same movie: different versions → one folder, labelled files;
+    # identical-looking ones → reported as duplicates, nothing touched.
+    for gkey, members in dupgroups.items():
+        prim_path = members[0]
+        prim = None
+        for lst in (plan, skip):
+            for r in lst:
+                if r.get("path") == prim_path and r.get("reason") in (None, "already_ok", "flatten_discs_only"):
+                    prim = r
+                    lst.remove(r)
+                    break
+            if prim:
+                break
+        if prim is None:
+            prim = next((r for r in skip if r.get("path") == prim_path), None)
+            for m in members[1:]:
+                skip.append({**m, "reason": "dest_exists"})
+            continue
+        group = [prim] + members[1:]
+        verdict, labels = decide_duplicate_group(group)
+        base = re.sub(r"\s*\[tmdbid=\d+\]\s*$", "", prim["target"])
+        if verdict == "versions":
+            for r, lab in zip(group, labels):
+                r["version_label"] = lab
+                r["version_videos"] = list(r["version_profile"]["videos"])
+                r["version_base"] = base
+                r["version_info"] = describe_profile(r["version_profile"])
+            prim["reason"] = "version_primary"
+            plan.append(prim)
+            for r in group[1:]:
+                plan.append({**r, "action": "merge_version", "dest": prim["dest"],
+                             "target": prim["target"], "reason": "version_merge"})
+        else:
+            summary = "；".join(f"{Path(r['path']).name} → {describe_profile(r['version_profile'])}"
+                               for r in group)
+            for r in group:
+                skip.append({**r, "reason": "duplicate_movie", "note": "重复：" + summary})
 
     # Promote multidisc merge skips into plan so apply actually moves them
     primary_dest = {p.get("path"): p.get("dest") for p in plan if p.get("dest")}

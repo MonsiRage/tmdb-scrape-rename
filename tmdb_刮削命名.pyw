@@ -128,6 +128,7 @@ REASON_ZH = {
     "ambiguous_movie_and_tv": "电影和剧集都匹配到了（请确认）",
     "search_error": "搜索出错",
     "uncertain_title_only": "不确定：需要确认（未改名）",
+    "duplicate_movie": "重复影片（请决定保留哪个）",
     "empty_query": "查询为空",
     "no_usable_title": "没有可用标题",
     "rename_failed": "改名失败",
