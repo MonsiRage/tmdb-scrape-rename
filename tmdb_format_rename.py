@@ -3798,13 +3798,15 @@ def _download_bytes(url: str, dest: Path, min_size: int = 500) -> str:
             if not data or len(data) < min_size:
                 return "too_small"
             tmp.write_bytes(data)
-            if dest.exists():
+            existed = dest.exists()
+            if existed:
                 try:
                     dest.unlink()
                 except Exception:
                     pass
             tmp.replace(dest)
-            _log_op("create", path=str(dest))
+            if not existed:  # undo removes only what this run added
+                _log_op("create", path=str(dest))
             return "ok"
         except Exception as e:
             last_err = str(e)
@@ -4218,8 +4220,10 @@ def write_tmdb_html(folder: Path, meta: dict, tid: str, preview: bool = False) -
     try:
         html = build_tmdb_html(meta, str(tid), folder)
         dest = folder / "tmdb.html"
+        existed = dest.exists()
         dest.write_text(html, encoding="utf-8")
-        _log_op("create", path=str(dest))
+        if not existed:  # a refreshed snapshot is not a change to undo
+            _log_op("create", path=str(dest))
         return f"ok:{dest.name}"
     except Exception as e:
         return f"err:{e}"
@@ -4264,8 +4268,10 @@ def write_movie_nfo(folder: Path, meta: dict, tid: str, preview: bool = False, k
         else:
             for vf in videos:
                 dest = folder / f"{vf.stem}.nfo"
+                existed = dest.exists()
                 dest.write_text(xml, encoding="utf-8")
-                _log_op("create", path=str(dest))
+                if not existed:
+                    _log_op("create", path=str(dest))
                 written.append(dest.name)
             # Do NOT delete existing movie.nfo — Emby primary; we only write when none existed.
         return "ok:" + ",".join(written)
@@ -5094,68 +5100,134 @@ def season_folder_name(n: int) -> str:
     return f"Season {n:02d}"
 
 
+# Scraper files that describe the whole show; they stay at the top of the show folder.
+SHOW_LEVEL_FILES = {
+    "tvshow.nfo", "tmdb.html", "poster.jpg", "fanart.jpg", "clearlogo.png", "landscape.jpg",
+    "banner.jpg", "logo.png", "folder.jpg", "backdrop.jpg", "clearart.png",
+}
+
+
+def _ensure_dir(d: Path) -> None:
+    if not d.exists():
+        _log_op("mkdir", path=str(d))
+    d.mkdir(parents=True, exist_ok=True)
+
+
 def move_into_season(src: Path, dest: Path, season: int) -> None:
-    """Move everything in src (loose episodes) into dest/Season NN, then drop empty src."""
+    """Move a season folder's content into dest/Season NN, then drop the empty src.
+    Show-level scraper files go to the top of dest when it has none yet."""
     sd = dest / season_folder_name(season)
-    merge_folder_into(src, sd)
+    _ensure_dir(sd)
+    for child in list(src.iterdir()):
+        if child.is_file() and child.name.lower() in SHOW_LEVEL_FILES and not (dest / child.name).exists():
+            _rename_one(child, dest / child.name)
+        elif child.is_file() and child.name.lower() == "tvshow.nfo":
+            # The show already has one; inside a season folder it would only confuse Emby.
+            _rename_one(child, _unique_child_path(sd, "tvshow.nfo.old"))
+        else:
+            _rename_one(child, _unique_child_path(sd, child.name))
+    try:
+        if not any(src.iterdir()):
+            src.rmdir()
+            _log_op("rmdir", path=str(src))
+    except Exception:
+        pass
 
 
 def wrap_into_season(folder: Path, season: int) -> None:
-    """A show folder that holds one season's episodes loose: put them into Season NN inside it."""
+    """A show folder that holds one season's episodes loose: put them into Season NN inside it.
+    Show-level scraper files, Season folders and extras folders stay where they are."""
     sd = folder / season_folder_name(season)
-    kids = [c for c in list(folder.iterdir())
-            if c != sd and not (c.is_dir() and is_season_dir_name(c.name))]
+    kids = []
+    for c in list(folder.iterdir()):
+        if c == sd:
+            continue
+        if c.is_dir():
+            if is_season_dir_name(c.name) or is_extras_dir(c.name) or should_prune(c.name):
+                continue
+        elif c.name.lower() in SHOW_LEVEL_FILES:
+            continue
+        kids.append(c)
     if not kids:
         return
-    if not sd.exists():
-        _log_op("mkdir", path=str(sd))
-    sd.mkdir(exist_ok=True)
+    _ensure_dir(sd)
     for c in kids:
         _rename_one(c, _unique_child_path(sd, c.name))
+
+
+EXISTING_SHOW = "\0existing:"   # group marker: the show folder already exists under its final name
+
+
+def _season_layout(r: dict):
+    """('show', {season numbers}) for a folder holding Season NN subfolders, else
+    ('season', n): the one season the folder holds (from its name, else its episode files)."""
+    p = Path(r["path"])
+    subs = set()
+    for n, isd, _isf in _entries(p):
+        if isd and is_season_dir_name(n):
+            k = season_number_from_name(n)
+            subs.add(k if k is not None else n.lower())
+    if subs:
+        return "show", subs
+    n = season_number_from_name(r.get("name") or "")
+    if n is None:
+        loc = [k for k in local_season_counts(p) if k >= 1]
+        if len(loc) == 1:
+            n = loc[0]
+    return "season", n
 
 
 def resolve_season_group(prim: dict, others: list) -> tuple[list, list]:
     """Folders of the same TV show: put each season under one show folder.
 
-    Returns (plan_records, skip_records). A group is only merged when every folder's season
-    can be read from its name (or it already contains Season subfolders) and no two folders
-    claim the same season; otherwise nothing in the group is moved."""
-    group = [prim] + others
-    seasons = []
-    for r in group:
-        p = Path(r["path"])
-        if r.get("kind") == "tv_show":
-            subs = {x.name.lower() for x in p.iterdir() if x.is_dir() and is_season_dir_name(x.name)} if p.exists() else set()
-            seasons.append(("show", subs))
+    prim is the folder that keeps the show's name (or, with prim["existing"], a show folder
+    that is already there). Returns (plan_records, skip_records). Nothing in the group moves
+    unless every season can be told apart: from the name (S03 / 第三季), the episode files,
+    or Season NN subfolders, and no season is claimed twice (also not by an existing
+    Season NN folder)."""
+    group = [prim] + list(others)
+    layout = [_season_layout(r) for r in group]
+    shows = [i for i, (k, _v) in enumerate(layout) if k == "show"]
+    if shows and shows[0] != 0 and not prim.get("existing") and len(shows) == 1:
+        # The folder that already has Season subfolders becomes the show folder.
+        i = shows[0]
+        group[0], group[i] = group[i], group[0]
+        layout[0], layout[i] = layout[i], layout[0]
+        for key in ("dest", "target"):
+            group[0][key] = prim[key]
+        shows = [0]
+    why = ""
+    if len(shows) > 1 or (shows and shows[0] != 0):
+        why = "有多个文件夹都已经分好季"
+    claimed = set(layout[0][1]) if layout[0][0] == "show" else set()
+    for k, v in layout:
+        if why or k == "show":
+            continue
+        if v is None:
+            why = "看不出是第几季"
+        elif v in claimed:
+            why = f"第{v}季有两份"
         else:
-            n = season_number_from_name(r.get("name") or "")
-            seasons.append(("season", n))
-    bad = [i for i, (k, v) in enumerate(seasons) if k == "season" and v is None]
-    claimed: dict = {}
-    clash = False
-    for k, v in seasons:
-        if k == "season" and v is not None:
-            clash |= v in claimed
-            claimed[v] = True
-    if bad or clash:
-        why = "看不出是第几季" if bad else "有两个文件夹是同一季"
-        return [], [{**r, "reason": "season_merge_unclear", "note": f"同一部剧有多个文件夹，但{why}，未合并"} for r in group]
+            claimed.add(v)
+    movers = [r for r in group if not r.get("existing")]
+    if why:
+        return [], [{**r, "reason": "season_merge_unclear", "note": f"同一部剧有多个文件夹，但{why}，未合并"} for r in movers]
     plan = []
-    for i, (r, (k, v)) in enumerate(zip(group, seasons)):
+    first = dict(group[0])
+    if layout[0][0] == "season":
+        first["season_wrap"] = layout[0][1]
+    if first.get("season_wrap") is not None or str(first.get("path")) != str(first.get("dest")):
+        first["reason"] = "season_primary"
+        first.pop("existing", None)
+        plan.append(first)
+    for r, (k, v) in zip(group[1:], layout[1:]):
         r = dict(r)
-        if i == 0:
-            r["reason"] = "season_primary"
-            if k == "season":
-                r["season_wrap"] = v
-            plan.append(r)
-        else:
-            r["action"] = "merge_season"
-            r["dest"] = prim["dest"]
-            r["target"] = prim["target"]
-            r["reason"] = "season_merge"
-            if k == "season":
-                r["season_no"] = v
-            plan.append(r)
+        r["action"] = "merge_season"
+        r["dest"] = prim["dest"]
+        r["target"] = prim["target"]
+        r["reason"] = "season_merge"
+        r["season_no"] = v
+        plan.append(r)
     return plan, []
 
 
@@ -5872,6 +5944,10 @@ def main():
                 skip.append({**rec, "reason": "already_ok"})
             continue
         dp, sp = Path(dest), Path(L["path"])
+        if MERGE_SEASONS and _is_tv_leaf(L) and dp.is_dir() and str(dp).lower() != str(sp).lower():
+            # The show folder is already there (scraped before): add this season to it.
+            dupgroups.setdefault(key, [EXISTING_SHOW + dest]).append(rec)
+            continue
         try:
             if dp.exists() and dp.resolve() != sp.resolve():
                 skip.append({**rec, "reason": "dest_exists"})
@@ -5886,6 +5962,16 @@ def main():
     # identical-looking ones → reported as duplicates, nothing touched.
     for gkey, members in dupgroups.items():
         prim_path = members[0]
+        if prim_path.startswith(EXISTING_SHOW):
+            dest0 = prim_path[len(EXISTING_SHOW):]
+            first = members[1]
+            prim = {"path": dest0, "name": Path(dest0).name, "parent": first.get("parent"), "dest": dest0,
+                    "target": first.get("target"), "tmdb": first.get("tmdb"), "media": "tv",
+                    "title": first.get("title"), "year": first.get("year"), "existing": True}
+            p_recs, s_recs = resolve_season_group(prim, members[1:])
+            plan.extend(p_recs)
+            skip.extend(s_recs)
+            continue
         prim = None
         for lst in (plan, skip):
             for r in lst:
