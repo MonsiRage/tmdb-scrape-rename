@@ -442,7 +442,8 @@ DEFAULT_TEMPLATE = "{title} ({year}) [tmdbid={tid}]"
 
 
 def valid_template(tpl: str) -> bool:
-    return bool(tpl) and "{title}" in tpl and not re.search(r"\{(?!title\}|year\}|tid\}|original\}|edition\})", tpl)
+    """Only two folder patterns exist: title-based or original-name-based (never both)."""
+    return tpl in (DEFAULT_TEMPLATE, "{original} ({year}) [tmdbid={tid}]")
 
 
 def render_name(tpl: str, title: str, year, tid, original: str = "", edition: str = "") -> str:
@@ -490,7 +491,7 @@ def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str
         return len(name) <= budget
 
     cands = []
-    if NAME_TEMPLATE and tid:
+    if NAME_TEMPLATE and tid and (original or "{original}" not in NAME_TEMPLATE):
         cands.append(render_name(NAME_TEMPLATE, title, year_s, tid, original, edition))
     if tid and year_s:
         cands.append(f"{title} ({year_s}) [tmdbid={tid}]")
@@ -5792,13 +5793,13 @@ def main():
     for a in args:
         if a.startswith("--title-lang="):
             v = a.split("=", 1)[1].strip()
-            TITLE_LANG = v if v in ("auto", "zh-TW", "en", "original") else "auto"
+            TITLE_LANG = v if v in ("auto", "zh-TW", "en") else "auto"
         elif a.startswith("--name-template="):
             v = a.split("=", 1)[1].strip().strip('"')
             if valid_template(v):
                 NAME_TEMPLATE = v if v != DEFAULT_TEMPLATE else ""
             else:
-                print(f"命名模板无效（必须含 {{title}}，只能用 {{title}} {{year}} {{tid}} {{original}} {{edition}}），已改用默认格式：{v}", flush=True)
+                print(f"命名格式无效（只支持 {{title}} ({{year}}) [tmdbid={{tid}}] 或 {{original}} ({{year}}) [tmdbid={{tid}}]），已改用默认格式：{v}", flush=True)
     global ACCEPT_UNCERTAIN
     ACCEPT_UNCERTAIN = "--accept-uncertain" in args
     media = "auto"

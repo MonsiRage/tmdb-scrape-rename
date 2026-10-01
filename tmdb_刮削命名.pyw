@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -92,8 +91,10 @@ def read_saved_api_key() -> str:
     return (os.environ.get("TMDB_API_KEY") or "").strip()
 
 
-LANG_CHOICES = {"自动（中文优先）": "auto", "繁体中文": "zh-TW", "英文": "en", "原名": "original"}
+LANG_CHOICES = {"自动（中文优先）": "auto", "繁体中文": "zh-TW", "英文": "en"}
 DEFAULT_TEMPLATE = "{title} ({year}) [tmdbid={tid}]"
+ORIGINAL_TEMPLATE = "{original} ({year}) [tmdbid={tid}]"
+NAME_CHOICES = {"标题 (年份) [tmdbid=编号]": DEFAULT_TEMPLATE, "原名 (年份) [tmdbid=编号]": ORIGINAL_TEMPLATE}
 
 
 def load_settings() -> dict:
@@ -297,15 +298,12 @@ class App(tk.Tk):
         ttk.Label(r1, text="只影响文件夹名；找不到该语言的标题时用默认（中文优先）。", foreground="#666").pack(side=tk.LEFT)
         r2 = ttk.Frame(fmt)
         r2.pack(fill=tk.X, padx=8, pady=2)
-        ttk.Label(r2, text="命名格式").pack(side=tk.LEFT)
-        self.tpl_var = tk.StringVar(value=st.get("template") or DEFAULT_TEMPLATE)
-        ttk.Entry(r2, textvariable=self.tpl_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        ttk.Button(r2, text="恢复默认", command=lambda: self.tpl_var.set(DEFAULT_TEMPLATE)).pack(side=tk.LEFT)
-        ttk.Label(
-            fmt,
-            text="可用：{title}标题 {year}年份 {tid}编号 {original}原名 {edition}版本（如 Extended）。[tmdbid=编号] 始终保留。",
-            foreground="#666",
-        ).pack(anchor="w", padx=8)
+        ttk.Label(r2, text="文件夹格式").pack(side=tk.LEFT)
+        name_labels = list(NAME_CHOICES)
+        cur = next((k for k, v in NAME_CHOICES.items() if v == st.get("template")), name_labels[0])
+        self.tpl_var = tk.StringVar(value=cur)
+        ttk.Combobox(r2, textvariable=self.tpl_var, values=name_labels, state="readonly", width=28).pack(side=tk.LEFT, padx=8)
+        ttk.Label(r2, text="二选一：用标题（受上面语言影响），或用 TMDB 的原名。", foreground="#666").pack(side=tk.LEFT)
         ttk.Label(
             fmt,
             text="同一部剧各季的独立文件夹会自动合并到「剧名/Season NN」；同一部电影的不同版本会合并并加版本标记。预览里逐条列出，改错可「撤销上次改名」。",
@@ -411,10 +409,7 @@ class App(tk.Tk):
                 "请填写 TMDB API Key。\n它会保存在 %AppData%\\Roaming\\TMDB刮削命名\\tmdb_api_key.txt。",
             )
             return
-        tpl = (self.tpl_var.get() or "").strip()
-        if tpl != DEFAULT_TEMPLATE and ("{title}" not in tpl or re.search(r"\{(?!title\}|year\}|tid\}|original\}|edition\})", tpl)):
-            messagebox.showerror("命名格式无效", "命名格式必须包含 {title}，并且只能用 {title} {year} {tid} {original} {edition}。")
-            return
+        tpl = NAME_CHOICES.get(self.tpl_var.get(), DEFAULT_TEMPLATE)
         save_settings({"lang": self.lang_var.get(), "template": tpl})
         media = "auto"
         self._only_new = bool(self.only_new_var.get()) if getattr(self, "only_new_var", None) is not None else bool(getattr(self, "_only_new", True))
@@ -1201,7 +1196,7 @@ class App(tk.Tk):
         if lang != "auto":
             cli.append(f"--title-lang={lang}")
         tpl = (st.get("template") or "").strip()
-        if tpl and tpl != DEFAULT_TEMPLATE:
+        if tpl == ORIGINAL_TEMPLATE:
             cli.append(f"--name-template={tpl}")
         if cli_override:
             cli = list(cli_override)
