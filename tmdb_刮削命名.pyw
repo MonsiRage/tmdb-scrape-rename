@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -410,15 +411,22 @@ class App(tk.Tk):
         tree.bind("<Double-1>", lambda e, t=tree: self._copy_tree_row(t))
         return tree
 
+    @staticmethod
+    def _sort_rows(tree: ttk.Treeview, col: str, reverse: bool) -> None:
+        """Case-insensitive, natural order (第2季 before 第10季)."""
+        def key(x):
+            return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", str(x[0]).casefold())]
+        rows = [(tree.set(iid, col), iid) for iid in tree.get_children("")]
+        rows.sort(key=key, reverse=reverse)
+        for idx, (_val, iid) in enumerate(rows):
+            tree.move(iid, "", idx)
+
     def _sort_tree_by(self, tree: ttk.Treeview, col: str, labels: dict) -> None:
         """Click column header to toggle A→Z / Z→A sort (名称 & 路径最实用)."""
         state = getattr(tree, "_sort_state", {})
         reverse = bool(state.get(col, False))
-        rows = [(tree.set(iid, col), iid) for iid in tree.get_children("")]
-        # Case-insensitive; paths sort naturally by full string
-        rows.sort(key=lambda x: str(x[0]).casefold(), reverse=reverse)
-        for idx, (_val, iid) in enumerate(rows):
-            tree.move(iid, "", idx)
+        self._sort_rows(tree, col, reverse)
+        tree._last_sort = (col, reverse)  # type: ignore[attr-defined]
         # Update heading marks; clear other columns' arrows
         for c, text in labels.items():
             if c == col:
@@ -496,7 +504,7 @@ class App(tk.Tk):
 
         self.summary = ttk.Label(
             self,
-            text="运行中…完成后可在下方标签页查看；长路径用横向滑动条，双击一行可复制。",
+            text="运行中…完成后可在下方标签页查看；点表头可排序，长路径用横向滑动条，双击一行可复制。",
             foreground="#444",
         )
         self.summary.pack(fill=tk.X, padx=12, pady=(0, 6))
@@ -577,6 +585,9 @@ class App(tk.Tk):
             else:
                 a, b, c = row[0], row[1], row[2]
                 tree.insert("", tk.END, values=(kind, a, b, c))
+        last = getattr(tree, "_last_sort", None)
+        if last:
+            self._sort_rows(tree, last[0], last[1])
 
     def _pick_candidate(self, tree: ttk.Treeview) -> None:
         """Double-click on a row of 需要确认: choose the right TMDB entry for that folder."""
@@ -861,7 +872,7 @@ class App(tk.Tk):
             f"跳过合计：{skip_count}",
             f"详细 JSON：{last_path}",
             "",
-            "提示：列表可用底部横向滑动条查看长路径；双击一行可复制。",
+            "提示：点表头可按该列排序（再点一次倒序）；长路径用底部横向滑动条；双击一行可复制。",
         ]
         if preview:
             lines.append("预览满意后，点右上角「确认并正式刮削」即可，无需重新打开程序。")
