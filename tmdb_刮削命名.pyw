@@ -582,7 +582,7 @@ class App(tk.Tk):
         box = ttk.LabelFrame(top, text="候选")
         box.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
         for i, c in enumerate(cands):
-            where = "·".join(x for x in (c.get("year"), c.get("country") or c.get("lang")) if x)
+            where = "·".join(x for x in (c.get("year"), c.get("country") or c.get("lang"), (f"片长{c['runtime']}分钟" if c.get("runtime") else "")) if x)
             kind_zh = "电影" if c.get("media") == "movie" else "剧集"
             text = f"{kind_zh}《{c.get('title') or c.get('original') or ''}》({where or '?'})  原名：{c.get('original') or ''}  [tmdbid={c.get('tmdb')}]"
             ttk.Radiobutton(box, text=text, variable=var, value=str(i)).pack(anchor="w", padx=8, pady=2)

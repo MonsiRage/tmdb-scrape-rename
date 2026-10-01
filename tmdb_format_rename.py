@@ -1952,7 +1952,8 @@ def _cand_summary(cand_lists: list, q: str, limit: int = 6) -> list:
 
 def describe_candidate(c: dict) -> str:
     where = "·".join(x for x in (c.get("year"), c.get("country") or c.get("lang")) if x)
-    return f"{'电影' if c.get('media') == 'movie' else '剧集'}《{c.get('title') or c.get('original') or ''}》({where or '?'}) [tmdbid={c.get('tmdb')}]"
+    rt = f" {c['runtime']}分钟" if c.get("runtime") else ""
+    return f"{'电影' if c.get('media') == 'movie' else '剧集'}《{c.get('title') or c.get('original') or ''}》({where or '?'}{rt}) [tmdbid={c.get('tmdb')}]"
 
 
 def _search_cache_key(q: str, year, prefer_tid: str = "", prefer_kind: str = "", region_key: str = "") -> str:
@@ -4656,6 +4657,254 @@ def stamp_item_media(item: dict) -> dict:
     return item
 
 
+# ---------------------------------------------------------------------------
+# Video length (movies only). Read from the file header in pure Python:
+# MP4/MOV/M4V (mvhd) and MKV/WEBM (Info/Duration). Anything else, or any
+# error, gives None and the check is simply skipped.
+# ---------------------------------------------------------------------------
+def _mp4_duration(f, size: int) -> float | None:
+    def walk(start: int, end: int, want: bytes):
+        pos = start
+        while pos + 8 <= end:
+            f.seek(pos)
+            hdr = f.read(16)
+            if len(hdr) < 8:
+                return
+            bsize = int.from_bytes(hdr[:4], "big")
+            btype = hdr[4:8]
+            hlen = 8
+            if bsize == 1 and len(hdr) >= 16:
+                bsize = int.from_bytes(hdr[8:16], "big")
+                hlen = 16
+            elif bsize == 0:
+                bsize = end - pos
+            if bsize < hlen:
+                return
+            if btype == want:
+                yield pos + hlen, min(pos + bsize, end)
+            pos += bsize
+
+    for m_start, m_end in walk(0, size, b"moov"):
+        for h_start, _h_end in walk(m_start, m_end, b"mvhd"):
+            f.seek(h_start)
+            body = f.read(32)
+            if len(body) < 20:
+                return None
+            if body[0] == 1 and len(body) >= 32:
+                timescale = int.from_bytes(body[20:24], "big")
+                dur = int.from_bytes(body[24:32], "big")
+            else:
+                timescale = int.from_bytes(body[12:16], "big")
+                dur = int.from_bytes(body[16:20], "big")
+            return dur / timescale if timescale else None
+    return None
+
+
+def _ebml_vint(f, keep_marker: bool):
+    b = f.read(1)
+    if not b:
+        return None, 0
+    first = b[0]
+    length = 1
+    mask = 0x80
+    while length <= 8 and not (first & mask):
+        length += 1
+        mask >>= 1
+    if length > 8:
+        return None, 0
+    rest = f.read(length - 1)
+    if len(rest) != length - 1:
+        return None, 0
+    val = first if keep_marker else (first & (mask - 1))
+    for byte in rest:
+        val = (val << 8) | byte
+    unknown = (not keep_marker) and val == (1 << (7 * length)) - 1
+    return (None if unknown else val), length
+
+
+def _mkv_duration(f, size: int) -> float | None:
+    def children(start: int, end: int):
+        pos = start
+        for _ in range(4000):
+            if pos >= end:
+                return
+            f.seek(pos)
+            eid, il = _ebml_vint(f, True)
+            if eid is None:
+                return
+            esize, sl = _ebml_vint(f, False)
+            data = pos + il + sl
+            stop = end if esize is None else min(data + esize, end)
+            yield eid, data, stop
+            if stop <= pos:
+                return
+            pos = stop
+
+    for eid, data, stop in children(0, size):
+        if eid != 0x18538067:  # Segment
+            continue
+        for cid, cdata, cstop in children(data, stop):
+            if cid == 0x1F43B675:  # Cluster before Info: not a normal file
+                return None
+            if cid != 0x1549A966:  # Info
+                continue
+            scale, dur = 1000000, None
+            for iid, idata, istop in children(cdata, cstop):
+                f.seek(idata)
+                raw = f.read(istop - idata)
+                if iid == 0x2AD7B1:
+                    scale = int.from_bytes(raw, "big") or 1000000
+                elif iid == 0x4489 and len(raw) in (4, 8):
+                    import struct
+                    dur = struct.unpack(">f" if len(raw) == 4 else ">d", raw)[0]
+            return dur * scale / 1e9 if dur else None
+    return None
+
+
+def video_duration_seconds(path: Path) -> float | None:
+    try:
+        ext = path.suffix.lower()
+        if ext not in (".mp4", ".m4v", ".mov", ".mkv", ".webm"):
+            return None
+        size = path.stat().st_size
+        with open(long_path(path), "rb") as f:
+            d = _mp4_duration(f, size) if ext in (".mp4", ".m4v", ".mov") else _mkv_duration(f, size)
+        return d if d and 0 < d < 48 * 3600 else None
+    except Exception:
+        return None
+
+
+_EDITION_RE = re.compile(
+    r"(?i)extended|director'?s?[\s._-]*cut|uncut|unrated|final[\s._-]*cut|redux|special[\s._-]*edition|ultimate|"
+    r"collector|theatrical|complete[\s._-]*edition|加长|导演剪辑|未删减|完整版|终极版|特别版|院线版|戏院"
+)
+
+
+def leaf_duration_minutes(folder: Path) -> float | None:
+    """Length of the movie in a folder: the longest file, or the sum of its parts (CD1/CD2)."""
+    try:
+        videos = list_videos_in_dir(folder)
+    except Exception:
+        return None
+    groups: dict = {}
+    for v in videos:
+        d = video_duration_seconds(v)
+        if d and d >= 60:
+            groups.setdefault(multipart_base(v.stem), []).append(d)
+    if not groups:
+        return None
+    return max(sum(ds) for ds in groups.values()) / 60.0
+
+
+def runtime_fits(duration_min: float, runtime_min: float, edition: bool = False) -> bool:
+    """Is the file length plausible for a film TMDB lists at runtime_min?
+
+    Cuts differ: The Last Emperor is 163 min in cinemas and about 219 min extended,
+    so the window is wide on the long side (x1.45; x2.3 when the name says extended /
+    director's cut / 加长版) and a little narrow on the short side."""
+    if not runtime_min or runtime_min <= 0:
+        return True
+    lo = runtime_min * (0.7 if edition else 0.88) - 4
+    hi = runtime_min * (2.3 if edition else 1.45) + 10
+    return lo <= duration_min <= hi
+
+
+def check_movie_durations(leaves: list, cache: dict) -> tuple[list, list]:
+    """Cross-check movie leaves with the length of their video. Returns (kept, flagged).
+
+    A leaf is flagged (listed as uncertain, not renamed) when the video length does not
+    fit the chosen film but fits another film with the same title, or does not fit and
+    the folder year was already off. A length that merely differs on a film whose title
+    and year match is only noted (it may be another cut)."""
+    kept, flagged = [], []
+
+    def one(L):
+        if (L.get("media") or "movie") != "movie" or not L.get("tmdb") or L.get("id_from") == "user_choice":
+            return L, None
+        folder = Path(L["path"])
+        d = leaf_duration_minutes(folder)
+        if d is None:
+            return L, None
+        tid = str(L["tmdb"])
+        meta = cache.get(ckey(tid, "movie")) or {}
+        rt = meta.get("runtime")
+        rt = int(rt) if rt else None
+        name = L.get("name") or ""
+        edition = bool(_EDITION_RE.search(name + " " + " ".join(_leaf_video_stems(folder, 6))))
+        L["duration_min"] = round(d)
+        L["runtime_min"] = rt
+        if rt and runtime_fits(d, rt, edition):
+            L["duration_check"] = "ok"
+            return L, None
+        fy = extract_year(name) or L.get("search_year")
+        chosen_year = str(meta.get("year") or meta.get("release_date") or "")[:4]
+        weak = bool(fy and chosen_year and fy != chosen_year)
+        # Same-title films with a length that does fit.
+        q = L.get("search_query") or clean_query_title(name)
+        rivals = []
+        try:
+            found = _search_tmdb_one_kind("movie", q, None)
+        except Exception:
+            found = []
+        pool = [(tid2, r) for (_sc, tid2, r) in found if str(tid2) != tid and isinstance(r, dict) and _title_similarity(q, r) >= 1.0]
+        def _gap(item):
+            y = str(item[1].get("release_date") or "")[:4]
+            return abs(int(y) - int(fy)) if (y.isdigit() and fy and str(fy).isdigit()) else 99
+        pool.sort(key=_gap)
+        for tid2, r in pool[:4]:
+            try:
+                m2 = fetch_movie(str(tid2), cache, kind="movie")
+            except Exception:
+                continue
+            rt2 = m2.get("runtime") if isinstance(m2, dict) else None
+            rivals.append({
+                "media": "movie", "tmdb": str(tid2), "title": r.get("title") or "", "original": r.get("original_title") or "",
+                "year": str(r.get("release_date") or "")[:4], "country": "", "lang": r.get("original_language") or "",
+                "runtime": int(rt2) if rt2 else None,
+            })
+        fit = [c for c in rivals if c["runtime"] and runtime_fits(d, c["runtime"], edition)]
+        own = {
+            "media": "movie", "tmdb": tid, "title": meta.get("picked_title") or "", "original": meta.get("original_title") or "",
+            "year": chosen_year, "country": "", "lang": "", "runtime": rt,
+        }
+        mins = f"{int(d)}分钟"
+        if fit:
+            fit.sort(key=lambda c: abs(c["runtime"] - d))
+            best = fit[0]
+            L["duration_check"] = "rival_fits"
+            note = (
+                f"视频时长 {mins}，与所选《{own['title']}》({chosen_year}，{('片长%d分钟' % rt) if rt else '无片长记录'}) 不符，"
+                f"但和《{best['title']}》({best['year']}，{best['runtime']}分钟) 吻合"
+            )
+            return L, {"note": note, "candidates": [own] + fit + [c for c in rivals if c not in fit]}
+        if rt and weak:
+            L["duration_check"] = "mismatch_weak"
+            return L, {
+                "note": f"视频时长 {mins}，与《{own['title']}》片长 {rt} 分钟差得多，而且文件夹年份 {fy} 与它的 {chosen_year} 也不一致",
+                "candidates": [own] + rivals,
+            }
+        L["duration_check"] = "mismatch_noted" if rt else "unknown_runtime"
+        if rt:
+            L["duration_note"] = f"视频时长 {mins}，TMDB 片长 {rt} 分钟（可能是不同剪辑版）"
+        return L, None
+
+    for L, flag in _pmap(one, leaves):
+        if flag and not ACCEPT_UNCERTAIN:
+            L2 = dict(L)
+            L2.pop("tmdb", None)
+            L2.update({
+                "id_from": "uncertain_title_only",
+                "reason": "uncertain_title_only",
+                "note": flag["note"] + (" | " + candidates_note(flag["candidates"], 4) if flag["candidates"] else ""),
+                "candidates": flag["candidates"],
+                "candidate_tmdb": str(L.get("tmdb")),
+            })
+            flagged.append(L2)
+        else:
+            kept.append(L)
+    return kept, flagged
+
+
 def main():
     global MEDIA_KIND, API_KEY, TOOLS, CACHE_PATH, SEARCH_CACHE_PATH
     # GUI may set TMDB_API_KEY / TMDB_TOOLS_DIR after this module was first imported.
@@ -4886,6 +5135,17 @@ def main():
         if cache_needs_refetch(meta):
             fetch_movie(tid, cache, kind=kind)
     save_json(CACHE_PATH, cache)
+
+    # Movies: does the video's length fit the film we matched? (cheap header read)
+    if not media_is_tv():
+        leaves, dur_flagged = check_movie_durations(leaves, cache)
+        for L in leaves:
+            if L.get("duration_note"):
+                print(f"  时长提示: {(L.get('name') or '')[:60]} | {L['duration_note']}", flush=True)
+        for L in dur_flagged:
+            print(f"  时长对不上: {(L.get('name') or '')[:60]} | {L.get('note')}", flush=True)
+        unresolved.extend(dur_flagged)
+        save_json(CACHE_PATH, cache)
 
     # Multi-disc sibling folders (D1/D2…) sharing parent+tmdb → one folder
     leaves, multidisc_skips = collapse_multidisc_leaves(leaves, root)
