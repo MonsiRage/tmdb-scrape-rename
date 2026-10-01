@@ -1355,10 +1355,28 @@ def extract_year(name: str):
     s = name or ""
     if re.search(r"(?:19|20)\d{2}\s*[–—\-]\s*(?:19|20)\d{2}", s):
         return None
-    years = YEAR_RE.findall(strip_tmdb_markers(s))
+    s = strip_tmdb_markers(s)
+    # A year in brackets is the release year; a bare 4-digit number next to it
+    # (怒火攻心 (2006) 1948) may be an id or part of the title.
+    bracketed = re.findall(r"[\(\[（【]\s*((?:19|20)\d{2})\s*[\)\]）】]", s)
+    if bracketed:
+        return bracketed[-1]
+    years = YEAR_RE.findall(s)
     if not years:
         return None
     return years[-1]
+
+
+def other_year_candidates(name: str, year: str | None) -> list:
+    """Other year-looking numbers in a name, last first: tried when the chosen year finds nothing."""
+    s = strip_tmdb_markers(name or "")
+    if re.search(r"(?:19|20)\d{2}\s*[–—\-]\s*(?:19|20)\d{2}", s):
+        return []
+    out = []
+    for y in reversed(YEAR_RE.findall(s)):
+        if y != year and y not in out:
+            out.append(y)
+    return out
 
 
 def strip_year_range_tokens(s: str) -> str:
@@ -2128,6 +2146,9 @@ def folder_title_components(name: str) -> list[str]:
     n = strip_tmdb_markers(n)
     years = list(YEAR_RE.finditer(n))
     cut = years[-1].start(1) if years else len(n)
+    bracketed = list(re.finditer(r"[\(\[（【]\s*((?:19|20)\d{2})\s*[\)\]）】]", n))
+    if bracketed:  # (2006) is the year even when another number follows it
+        cut = bracketed[-1].start(1)
     tm = _TECH_CUT_RE.search(n)
     if tm and tm.start() < cut:
         cut = tm.start()
@@ -3677,7 +3698,7 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
         leaf["media"] = "tv" if media_is_tv() else "movie"
         leaf["id_from"] = "nfo"
         return True
-    year = extract_year(leaf["name"])
+    year = leaf.get("_year_override") or extract_year(leaf["name"])
     if not year and meta.get("year"):
         y = str(meta.get("year"))[:4]
         if y.isdigit():
@@ -3836,6 +3857,16 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
         leaf["search_year"] = year
         return False
     # A later "no results" must not hide that an earlier query failed to reach TMDB.
+    if not saw_search_error and not leaf.get("_year_retry"):
+        # Nothing found for this year: the name may carry another year-looking number.
+        alts = other_year_candidates(leaf.get("name") or "", year)
+        if alts:
+            leaf["_year_retry"] = True
+            leaf["_year_override"] = alts[0]
+            if resolve_leaf_id(leaf, search_cache):
+                return True
+            if leaf.get("id_from") in ("uncertain_title_only", "ambiguous_movie_and_tv", "ambiguous_no_year"):
+                return False
     leaf["id_from"] = "search_error" if saw_search_error else (last_how or "unresolved")
     leaf["search_query"] = last_query or (queries[0] if queries else "")
     leaf["search_year"] = year
