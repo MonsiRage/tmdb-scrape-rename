@@ -436,49 +436,7 @@ def _normalize_tv_payload(d):
     return out
 
 
-NAME_TEMPLATE = ""      # e.g. "{title} ({year}) [tmdbid={tid}]"; empty = the default pattern
-TITLE_LANG = "auto"     # auto (Chinese first) | zh-TW | en | original
-DEFAULT_TEMPLATE = "{title} ({year}) [tmdbid={tid}]"
-
-
-def valid_template(tpl: str) -> bool:
-    """Only two folder patterns exist: title-based or original-name-based (never both)."""
-    return tpl in (DEFAULT_TEMPLATE, "{original} ({year}) [tmdbid={tid}]")
-
-
-def render_name(tpl: str, title: str, year, tid, original: str = "", edition: str = "") -> str:
-    """Fill a naming template. Tokens: {title} {year} {tid} {original} {edition}.
-    Empty tokens vanish together with their brackets; the [tmdbid=N] tag is always kept."""
-    vals = {
-        "title": title or "",
-        "year": str(year) if year and re.fullmatch(r"\d{4}", str(year)) else "",
-        "tid": str(tid or ""),
-        "original": original or "",
-        "edition": edition or "",
-    }
-    out = tpl
-    for k, v in vals.items():
-        if not v:
-            out = re.sub(r"[\(\[（【]\s*\{%s\}\s*[\)\]）】]" % k, "", out)
-            out = out.replace("{%s}" % k, "")
-    for k, v in vals.items():
-        out = out.replace("{%s}" % k, v)
-    out = re.sub(r"\s{2,}", " ", out).strip(" ._-")
-    out = re.sub(r"(?:\s[-–]\s*)+$", "", out)
-    if vals["tid"] and "[tmdbid=" not in out:
-        out += f" [tmdbid={vals['tid']}]"
-    return out
-
-
-def edition_of(text: str) -> str:
-    for pat, lab in _VERSION_EDITIONS:
-        if re.search(pat, text or "", re.I):
-            return lab
-    return ""
-
-
-def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str = "",
-                    original: str = "", edition: str = "") -> str:
+def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str = "") -> str:
     """Keep full title when path budget allows; shorten only as needed."""
     title = win_safe(title or "") or "untitled"
     year_s = str(year) if year and re.fullmatch(r"\d{4}", str(year)) else ""
@@ -491,8 +449,6 @@ def fit_folder_name(title: str, year, tid, parent: Path, longest_child_name: str
         return len(name) <= budget
 
     cands = []
-    if NAME_TEMPLATE and tid and (original or "{original}" not in NAME_TEMPLATE):
-        cands.append(render_name(NAME_TEMPLATE, title, year_s, tid, original, edition))
     if tid and year_s:
         cands.append(f"{title} ({year_s}) [tmdbid={tid}]")
     if year_s:
@@ -2147,9 +2103,6 @@ def _search_cache_key(q: str, year, prefer_tid: str = "", prefer_kind: str = "",
     return f"{q}|{year or ''}|{mode}|{prefer_tid}|{prefer_kind}|{region_key or ''}|u5"
 
 
-# Set by main() from --accept-uncertain.
-ACCEPT_UNCERTAIN = False
-
 
 def _title_similarity(q: str, r: dict, region: dict | None = None) -> float:
     """1.0 for an exact (normalised) title match, else the best fuzzy ratio over the TMDB titles.
@@ -3248,7 +3201,7 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
             for qtry in uniq:
                 tid, how = search_tmdb(qtry, year, search_cache, prefer_kind=folder_media_hint(d.name))
                 query = qtry
-                if tid and not ACCEPT_UNCERTAIN:
+                if tid:
                     _cent = search_cache.get(_search_cache_key(qtry, year, "", folder_media_hint(d.name) or "")) or {}
                     if _cent.get("uncertain") or (
                         folder_title_mismatch_note(d.name, _cent.get("titles") or [])
@@ -3854,20 +3807,18 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                 # The query builder may have dropped a word of the real title (It Boy -> Boy).
                 note = folder_title_mismatch_note(leaf.get("name") or "", cent.get("titles") or [], region)
             if note:
-                if not ACCEPT_UNCERTAIN:
-                    # A guess: report it, do not rename unless confirmed.
-                    if pending is None:
-                        pending = {
-                            "id_from": "uncertain_title_only",
-                            "reason": "uncertain_title_only",
-                            "note": f"{note} | {candidates_note((cent or {}).get('candidates'))}",
-                            "search_query": query,
-                            "candidate_tmdb": str(tid),
-                            "candidates": (cent or {}).get("candidates") or [],
-                            "uncertain": note,
-                        }
-                    continue
-                leaf["uncertain"] = note
+                # A guess: report it, do not rename unless confirmed.
+                if pending is None:
+                    pending = {
+                        "id_from": "uncertain_title_only",
+                        "reason": "uncertain_title_only",
+                        "note": f"{note} | {candidates_note((cent or {}).get('candidates'))}",
+                        "search_query": query,
+                        "candidate_tmdb": str(tid),
+                        "candidates": (cent or {}).get("candidates") or [],
+                        "uncertain": note,
+                    }
+                continue
             leaf["tmdb"] = tid
             leaf["id_from"] = how
             leaf["search_query"] = query
@@ -4813,37 +4764,16 @@ def picked_title_from_cache(meta: dict):
     return meta.get("picked_title"), meta.get("year"), meta.get("picked_lang")
 
 
-def normalize_root_arg(raw: str) -> tuple[Path, list[str]]:
-    """Fix Windows bat quoting of drive roots (trailing backslash + quote).
-
-    Bats should pass "%CD%." ; also recover mangled drive-root + --preview.
-    """
-    extra: list[str] = []
-    s = (raw or "").strip().strip('"')
-    for flag in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new"):
-        if flag in s:
-            extra.append(flag)
-            idx = s.find(flag)
-            if idx >= 0:
-                s = s[:idx]
-            while s and s[-1] in ' "\\':
-                s = s[:-1]
-    s = s.strip().strip('"')
-    while s.endswith("\\") or s.endswith("/"):
-        # keep drive root as X:\  — strip only extras after we handle drive
-        if len(s) == 3 and s[1] == ":" and s[2] in "\\/":
-            break
-        if len(s) <= 3 and len(s) >= 2 and s[1] == ":":
-            break
-        s = s[:-1]
-    if len(s) == 2 and s[1] == ":":
-        s = s + "\\"
-    # "%CD%." -> E:\.
+def normalize_root_arg(raw: str) -> Path:
+    """Clean a root given on the command line: stray quotes, 'E:' -> 'E:\\', 'E:\\.' -> 'E:\\'."""
+    s = (raw or "").strip().strip('"').strip()
     if s.endswith("\\.") or s.endswith("/."):
         s = s[:-1]
-    elif len(s) >= 3 and s[-1] == "." and s[-2] in "\\/":
+    while len(s) > 3 and s[-1] in "\\/":
         s = s[:-1]
-    return Path(s), extra
+    if len(s) == 2 and s[1] == ":":
+        s += "\\"
+    return Path(s)
 
 
 
@@ -5499,45 +5429,6 @@ def apply_version_names(folder: Path, base: str, label: str, video_names: list) 
                 _rename_one(sc, sdst)
 
 
-def lang_title(meta: dict, mode: str):
-    """The title in the requested language, or None when TMDB has none (caller keeps the default)."""
-    if mode == "original":
-        return (meta.get("original_title") or "").strip() or None
-    if mode == "en":
-        return (meta.get("title_enus") or "").strip() or None
-    if mode == "zh-TW":
-        t = (meta.get("title_twr") or "").strip()
-        return t if readable_han_title(t) else None
-    return None
-
-
-def prefetch_title_lang(leaves: list, cache: dict) -> None:
-    """Fetch the English / Traditional-Chinese titles that the chosen language needs (cached in meta)."""
-    mode = TITLE_LANG
-    if mode not in ("en", "zh-TW"):
-        return
-    field, lang = ("title_enus", "en-US") if mode == "en" else ("title_twr", "zh-TW")
-    todo = {}
-    for L in leaves:
-        if not L.get("tmdb"):
-            continue
-        kind = L.get("media") if L.get("media") in ("movie", "tv") else ("tv" if media_is_tv() else "movie")
-        meta = cache.get(ckey(L["tmdb"], kind))
-        if isinstance(meta, dict) and meta.get("ok") and field not in meta:
-            todo[(str(L["tmdb"]), kind)] = meta
-
-    def one(item):
-        (tid, kind), meta = item
-        d = api_get(f"https://api.themoviedb.org/3/{kind}/{tid}?api_key={API_KEY}&language={lang}")
-        t = ""
-        if isinstance(d, dict) and not d.get("_error"):
-            t = (d.get("title") or d.get("name") or "").strip()
-        meta[field] = t
-        return None
-
-    list(_pmap(one, list(todo.items())))
-
-
 def tv_counts(tid: str, cache: dict) -> dict | None:
     """{"seasons": n, "episodes": n, "per": {season: episodes}} of a TMDB show (cached 14 days)."""
     ck = f"tvc:{tid}"
@@ -5656,7 +5547,7 @@ def check_tv_episodes(leaves: list, cache: dict) -> tuple[list, list]:
         return L, None
 
     for L, flag in _pmap(one, leaves):
-        if flag and not ACCEPT_UNCERTAIN:
+        if flag:
             L2 = dict(L)
             L2.pop("tmdb", None)
             L2.update({
@@ -5752,7 +5643,7 @@ def check_movie_durations(leaves: list, cache: dict) -> tuple[list, list]:
         return L, None
 
     for L, flag in _pmap(one, leaves):
-        if flag and not ACCEPT_UNCERTAIN:
+        if flag:
             L2 = dict(L)
             L2.pop("tmdb", None)
             L2.update({
@@ -5786,22 +5677,8 @@ def main():
     no_nfo = "--no-nfo" in args
     preview_nfo = "--preview-nfo" in args
     only_new = "--only-new" in args
-    global MERGE_SEASONS, NAME_TEMPLATE, TITLE_LANG
+    global MERGE_SEASONS
     MERGE_SEASONS = "--no-merge-seasons" not in args
-    TITLE_LANG = "auto"
-    NAME_TEMPLATE = ""
-    for a in args:
-        if a.startswith("--title-lang="):
-            v = a.split("=", 1)[1].strip()
-            TITLE_LANG = v if v in ("auto", "zh-TW", "en") else "auto"
-        elif a.startswith("--name-template="):
-            v = a.split("=", 1)[1].strip().strip('"')
-            if valid_template(v):
-                NAME_TEMPLATE = v if v != DEFAULT_TEMPLATE else ""
-            else:
-                print(f"命名格式无效（只支持 {{title}} ({{year}}) [tmdbid={{tid}}] 或 {{original}} ({{year}}) [tmdbid={{tid}}]），已改用默认格式：{v}", flush=True)
-    global ACCEPT_UNCERTAIN
-    ACCEPT_UNCERTAIN = "--accept-uncertain" in args
     media = "auto"
     if "--tv" in args or "--media=tv" in args:
         media = "tv"
@@ -5817,25 +5694,13 @@ def main():
     args = [
         a
         for a in args
-        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--accept-uncertain", "--no-merge-seasons", "--tv", "--media=tv", "--media=movie", "--media=auto")
+        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--no-merge-seasons", "--tv", "--media=tv", "--media=movie", "--media=auto")
         and not a.startswith("--media=")
-        and not a.startswith("--title-lang=")
-        and not a.startswith("--name-template=")
     ]
     if not args:
         root = Path(os.environ.get("TMDB_RENAME_ROOT") or os.getcwd())
     else:
-        root, glued = normalize_root_arg(args[0])
-        if "--preview" in glued or "-n" in glued:
-            preview = True
-        if "--no-poster" in glued:
-            no_poster = True
-        if "--no-nfo" in glued:
-            no_nfo = True
-        if "--preview-nfo" in glued:
-            preview_nfo = True
-        if "--only-new" in glued:
-            only_new = True
+        root = normalize_root_arg(args[0])
     try:
         root = root.resolve()
     except Exception:
@@ -6051,8 +5916,6 @@ def main():
     plan, skip = [], []
     skip.extend(multidisc_skips)
     multidisc_dest_by_primary = {}
-    prefetch_title_lang(leaves, cache)
-    save_json(CACHE_PATH, cache)
     used = {}
     dupgroups: dict = {}
     for L in leaves:
@@ -6062,10 +5925,6 @@ def main():
         if meta.get("ok") and meta.get("picked_title"):
             title, year, lang = picked_title_from_cache(meta)
             source = "tmdb"
-            if TITLE_LANG != "auto":
-                alt = lang_title(meta, TITLE_LANG)
-                if alt:
-                    title, lang = alt, TITLE_LANG
         if not title:
             nfo = find_nfo_meta(Path(L["path"]))
             t = (nfo.get("title") or nfo.get("originaltitle") or "").strip()
@@ -6077,11 +5936,7 @@ def main():
             continue
         parent = L["parent"]
         try:
-            target = fit_folder_name(
-                title, year, tid, Path(parent),
-                original=(meta.get("original_title") or ""),
-                edition=edition_of(L["name"] + " " + " ".join(_leaf_video_stems(Path(L["path"]), 4))),
-            )
+            target = fit_folder_name(title, year, tid, Path(parent))
         except Exception:
             target = build_name(title, year, tid)
         key = (parent.lower(), target.lower())
@@ -6274,29 +6129,12 @@ def main():
 
     # Stamp media for GUI: classify each TMDB id (cached; title-match on movie/tv id collisions).
     def _quick_stamp(rows):
-        out = []
-        for x in rows:
-            it = dict(x)
-            out.append(stamp_item_media(it))
-        return out
+        try:
+            return [stamp_item_media(dict(x)) for x in rows]
+        except Exception:
+            return rows
 
-    try:
-        leaves = _quick_stamp(leaves)
-    except Exception:
-        pass
-    try:
-        skip = _quick_stamp(skip)
-    except Exception:
-        pass
-    try:
-        plan = _quick_stamp(plan)
-    except Exception:
-        pass
-    try:
-        unresolved = _quick_stamp(unresolved)
-    except Exception:
-        pass
-
+    leaves, skip, plan, unresolved = (_quick_stamp(x) for x in (leaves, skip, plan, unresolved))
 
     log = {
         "root": str(root),
@@ -6318,8 +6156,6 @@ def main():
     save_exists_cache()
     if not preview:
         save_history(root)
-        if CHANGE_LOG:
-            print(f"改动已记录，可以用「撤销上次改名」还原（{len(CHANGE_LOG)} 步）。", flush=True)
     log_path = TOOLS / "tmdb_format_rename_last.json"
     log_path.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"详细日志文件: {log_path}", flush=True)
@@ -6447,6 +6283,8 @@ def main():
     print("  · 已有跳过 = 封面等文件已存在，不会重复下载", flush=True)
     if not preview:
         save_history(root)
+        if CHANGE_LOG:
+            print(f"改动已记录，可以用「撤销上次改名」还原（{len(CHANGE_LOG)} 步）。", flush=True)
     return 0 if not fail else 1
 
 

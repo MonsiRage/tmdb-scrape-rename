@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -89,26 +90,6 @@ def read_saved_api_key() -> str:
     except Exception:
         pass
     return (os.environ.get("TMDB_API_KEY") or "").strip()
-
-
-LANG_CHOICES = {"自动（中文优先）": "auto", "繁体中文": "zh-TW", "英文": "en"}
-DEFAULT_TEMPLATE = "{title} ({year}) [tmdbid={tid}]"
-ORIGINAL_TEMPLATE = "{original} ({year}) [tmdbid={tid}]"
-NAME_CHOICES = {"标题 (年份) [tmdbid=编号]": DEFAULT_TEMPLATE, "原名 (年份) [tmdbid=编号]": ORIGINAL_TEMPLATE}
-
-
-def load_settings() -> dict:
-    try:
-        return json.loads((data_dir() / "gui_settings.json").read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def save_settings(d: dict) -> None:
-    try:
-        (data_dir() / "gui_settings.json").write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
 
 
 def last_history() -> dict | None:
@@ -225,8 +206,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("TMDB 刮削命名")
-        self.geometry("760x700")
-        self.minsize(680, 640)
+        self.geometry("760x600")
+        self.minsize(680, 560)
         self.tools = find_tools_dir()
         self.script = self.tools / "tmdb_format_rename.py"
         self.proc = None
@@ -275,35 +256,13 @@ class App(tk.Tk):
             scope,
             text="勾选后，跳过名字里已有 [tmdbid=] 的文件夹。取消勾选，则整库重新检查。",
         ).pack(anchor="w", padx=28, pady=(0, 4))
-        self.accept_uncertain_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            scope,
-            text="同时改名「不确定」的匹配",
-            variable=self.accept_uncertain_var,
-        ).pack(anchor="w", padx=8)
         ttk.Label(
             scope,
-            text="标题对不上、没写年份又有同名候选、或剧集/电影类型对不上的，默认不改名，列在「需要确认」里并写明原因和候选。先预览确认，再勾选。",
+            text="标题对不上、没写年份又有同名候选、或剧集/电影类型对不上的，默认不改名，列在「需要确认」里并写明原因和候选。在那个标签里双击一行，选对的那个再跑。",
         ).pack(anchor="w", padx=28, pady=(0, 8))
 
-        st = load_settings()
-        fmt = ttk.LabelFrame(top, text="命名与语言")
+        fmt = ttk.LabelFrame(top, text="自动整理")
         fmt.pack(fill=tk.X, pady=(0, 10))
-        r1 = ttk.Frame(fmt)
-        r1.pack(fill=tk.X, padx=8, pady=(6, 2))
-        ttk.Label(r1, text="标题语言").pack(side=tk.LEFT)
-        lang_names = list(LANG_CHOICES)
-        self.lang_var = tk.StringVar(value=st.get("lang") if st.get("lang") in lang_names else lang_names[0])
-        ttk.Combobox(r1, textvariable=self.lang_var, values=lang_names, state="readonly", width=16).pack(side=tk.LEFT, padx=8)
-        ttk.Label(r1, text="只影响文件夹名；找不到该语言的标题时用默认（中文优先）。", foreground="#666").pack(side=tk.LEFT)
-        r2 = ttk.Frame(fmt)
-        r2.pack(fill=tk.X, padx=8, pady=2)
-        ttk.Label(r2, text="文件夹格式").pack(side=tk.LEFT)
-        name_labels = list(NAME_CHOICES)
-        cur = next((k for k, v in NAME_CHOICES.items() if v == st.get("template")), name_labels[0])
-        self.tpl_var = tk.StringVar(value=cur)
-        ttk.Combobox(r2, textvariable=self.tpl_var, values=name_labels, state="readonly", width=28).pack(side=tk.LEFT, padx=8)
-        ttk.Label(r2, text="二选一：用标题（受上面语言影响），或用 TMDB 的原名。", foreground="#666").pack(side=tk.LEFT)
         ttk.Label(
             fmt,
             text="同一部剧各季的独立文件夹会自动合并到「剧名/Season NN」；同一部电影的不同版本会合并并加版本标记。预览里逐条列出，改错可「撤销上次改名」。",
@@ -360,15 +319,6 @@ class App(tk.Tk):
         except Exception:
             self._only_new = True
 
-    def _sync_accept_uncertain(self) -> None:
-        var = getattr(self, "accept_uncertain_var", None)
-        if var is None:
-            return
-        try:
-            self._accept_uncertain = bool(var.get())
-        except Exception:
-            self._accept_uncertain = False
-
     def _toggle_api_key(self) -> None:
         self._api_key_entry.configure(show="" if self._show_key.get() else "*")
 
@@ -409,11 +359,8 @@ class App(tk.Tk):
                 "请填写 TMDB API Key。\n它会保存在 %AppData%\\Roaming\\TMDB刮削命名\\tmdb_api_key.txt。",
             )
             return
-        tpl = NAME_CHOICES.get(self.tpl_var.get(), DEFAULT_TEMPLATE)
-        save_settings({"lang": self.lang_var.get(), "template": tpl})
         media = "auto"
         self._only_new = bool(self.only_new_var.get()) if getattr(self, "only_new_var", None) is not None else bool(getattr(self, "_only_new", True))
-        self._sync_accept_uncertain()
         only_line = "只处理新文件夹，已有 [tmdbid=] 的会跳过。\n" if self._only_new else ""
         # 仅预览：直接开跑，不弹确认框；正式刮削才确认
         if not preview:
@@ -464,15 +411,22 @@ class App(tk.Tk):
         tree.bind("<Double-1>", lambda e, t=tree: self._copy_tree_row(t))
         return tree
 
+    @staticmethod
+    def _sort_rows(tree: ttk.Treeview, col: str, reverse: bool) -> None:
+        """Case-insensitive, natural order (第2季 before 第10季)."""
+        def key(x):
+            return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", str(x[0]).casefold())]
+        rows = [(tree.set(iid, col), iid) for iid in tree.get_children("")]
+        rows.sort(key=key, reverse=reverse)
+        for idx, (_val, iid) in enumerate(rows):
+            tree.move(iid, "", idx)
+
     def _sort_tree_by(self, tree: ttk.Treeview, col: str, labels: dict) -> None:
         """Click column header to toggle A→Z / Z→A sort (名称 & 路径最实用)."""
         state = getattr(tree, "_sort_state", {})
         reverse = bool(state.get(col, False))
-        rows = [(tree.set(iid, col), iid) for iid in tree.get_children("")]
-        # Case-insensitive; paths sort naturally by full string
-        rows.sort(key=lambda x: str(x[0]).casefold(), reverse=reverse)
-        for idx, (_val, iid) in enumerate(rows):
-            tree.move(iid, "", idx)
+        self._sort_rows(tree, col, reverse)
+        tree._last_sort = (col, reverse)  # type: ignore[attr-defined]
         # Update heading marks; clear other columns' arrows
         for c, text in labels.items():
             if c == col:
@@ -532,13 +486,6 @@ class App(tk.Tk):
             variable=self.only_new_var,
             command=self._sync_only_new,
         ).pack(side=tk.LEFT, padx=(16, 0))
-        self.accept_uncertain_var = tk.BooleanVar(value=bool(getattr(self, "_accept_uncertain", False)))
-        ttk.Checkbutton(
-            bar,
-            text="同时改名不确定的",
-            variable=self.accept_uncertain_var,
-            command=self._sync_accept_uncertain,
-        ).pack(side=tk.LEFT, padx=(12, 0))
 
         self.btn_stop = ttk.Button(bar, text="停止", command=self._stop)
         self.btn_stop.pack(side=tk.RIGHT)
@@ -557,7 +504,7 @@ class App(tk.Tk):
 
         self.summary = ttk.Label(
             self,
-            text="运行中…完成后可在下方标签页查看；长路径用横向滑动条，双击一行可复制。",
+            text="运行中…完成后可在下方标签页查看；点表头可排序，长路径用横向滑动条，双击一行可复制。",
             foreground="#444",
         )
         self.summary.pack(fill=tk.X, padx=12, pady=(0, 6))
@@ -638,6 +585,9 @@ class App(tk.Tk):
             else:
                 a, b, c = row[0], row[1], row[2]
                 tree.insert("", tk.END, values=(kind, a, b, c))
+        last = getattr(tree, "_last_sort", None)
+        if last:
+            self._sort_rows(tree, last[0], last[1])
 
     def _pick_candidate(self, tree: ttk.Treeview) -> None:
         """Double-click on a row of 需要确认: choose the right TMDB entry for that folder."""
@@ -889,62 +839,18 @@ class App(tk.Tk):
             rename_fail_list = []
 
         already_ok = [s for s in skip if s.get("reason") == "already_ok"]
-        # 重复（电影+剧集都命中 / 多候选）vs 真正刮削不到
-        dupe_reasons = {
-            "ambiguous_movie_and_tv",
-            "ambiguous_no_year",
-            "ambiguous",
-            "multiple_matches",
-        }
-        fail_reasons = {
-            "no_tmdb_id",
-            "no_results",
-            "search_error",
-            "empty_query",
-            "no_usable_title",
-            "skip_no_tmdb",
-            "rename_failed",
-            "dest_exists",
-            "not_found",
-        }
         unmatched = [s for s in skip if s.get("reason") != "already_ok"]
-        dupe_skips = [s for s in unmatched if (s.get("reason") or "") in dupe_reasons]
-        problem_skips = [
-            s for s in unmatched
-            if (s.get("reason") or "") in fail_reasons
-            or (not s.get("tmdb") and (s.get("reason") or "") not in dupe_reasons)
-        ]
-        # leftovers that are neither dupe nor clear fail → treat as fail (scrape miss)
-        known = dupe_reasons | fail_reasons | {"already_ok"}
-        for s in unmatched:
-            r = s.get("reason") or ""
-            if r in known:
-                continue
-            if s in dupe_skips or s in problem_skips:
-                continue
-            problem_skips.append(s)
 
         leaf_count = int(data.get("leaf_count") or len(leaves) or len(already_ok))
         plan_count = int(data.get("plan_count") or len(plan))
         wrap_count = int(data.get("wrapped_count") or len(wrapped))
         skip_count = int(data.get("skip_count") or len(skip))
         ok_count = len(ok_list)
-        
 
         mode = "仅预览" if preview else "正式刮削"
         tip = ""
         if preview and self._last_was_preview:
             tip = "  → 可点右上角「确认并正式刮削」"
-        self.summary.configure(
-            text=(
-                f"【{media_zh}】{mode}完成 · 已识别 {leaf_count} · 更改(待) {plan_count} · "
-                f"已正确命名 {len(already_ok)} · 跳过已刮削 {int(data.get('skipped_done_count') or 0)} · "
-                f"需要确认 {len(unmatched)} · "
-                f"散落(入更改) {wrap_count} · 改名成功 {ok_count}"
-                + tip
-            )
-        )
-
         # Keep runner media in sync with result JSON (avoid mixing movie/tv reads)
         self._media = media
         self.title(f"TMDB 刮削命名 — 【{media_zh}】结果")
@@ -966,7 +872,7 @@ class App(tk.Tk):
             f"跳过合计：{skip_count}",
             f"详细 JSON：{last_path}",
             "",
-            "提示：列表可用底部横向滑动条查看长路径；双击一行可复制。",
+            "提示：点表头可按该列排序（再点一次倒序）；长路径用底部横向滑动条；双击一行可复制。",
         ]
         if preview:
             lines.append("预览满意后，点右上角「确认并正式刮削」即可，无需重新打开程序。")
@@ -1013,7 +919,6 @@ class App(tk.Tk):
                         f"→ {p.get('target') or p.get('dest') or ''}",
                     )
                 )
-            tab_note = "更改"
         else:
             # 正式刮削后优先显示本次已更改；若无改名结果则仍显示计划（例如无需改名）
             src_rows = ok_list if ok_list else plan
@@ -1031,7 +936,6 @@ class App(tk.Tk):
                         or "",
                     )
                 )
-            tab_note = "更改"
         # 散落整理并入「更改」：建夹/改标题与文件夹改名同属整理
         for w in wrapped:
             action = (w.get("action") or "").strip()
@@ -1053,7 +957,7 @@ class App(tk.Tk):
             change_rows.append((type_zh, name, status, detail))
         # 散落整理也仍显示「更改」，不把状态写进标签名
         self._fill_tree("changes", change_rows)
-        self._set_tab_title("changes", tab_note, len(change_rows))
+        self._set_tab_title("changes", "更改", len(change_rows))
 
         def _um_row(item, default_reason=""):
             reason = item.get("reason") or item.get("id_from") or default_reason or "unmatched"
@@ -1162,7 +1066,7 @@ class App(tk.Tk):
             return
         for w in self.winfo_children():
             w.destroy()
-        self.geometry("760x700")
+        self.geometry("760x600")
         self.title("TMDB 刮削命名")
         self._scan_root = None
         self._last_was_preview = False
@@ -1186,18 +1090,8 @@ class App(tk.Tk):
         cli = [str(root), f"--media={media}"]
         if getattr(self, "_only_new", False):
             cli.append("--only-new")
-        self._sync_accept_uncertain()
-        if getattr(self, "_accept_uncertain", False):
-            cli.append("--accept-uncertain")
         if preview:
             cli.append("--preview")
-        st = load_settings()
-        lang = LANG_CHOICES.get(st.get("lang") or "", "auto")
-        if lang != "auto":
-            cli.append(f"--title-lang={lang}")
-        tpl = (st.get("template") or "").strip()
-        if tpl == ORIGINAL_TEMPLATE:
-            cli.append(f"--name-template={tpl}")
         if cli_override:
             cli = list(cli_override)
         self._log("=" * 60)
