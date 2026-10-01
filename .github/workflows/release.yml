@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v1.13"
+        description: "Release tag, e.g. v1.14"
         required: true
-        default: "v1.13"
+        default: "v1.14"
 
 permissions:
   contents: write
@@ -37,8 +37,15 @@ jobs:
           $notes = @'
           Windows 可执行版。不需要安装 Python，也不需要旁边的 .py。
 
-          修复：exe 放在网络盘 / NAS（例如 Z:\）上时，启动报 WinError 1005（The volume does not contain a recognized file system）直接崩溃。现在查不到真实路径时按原路径继续启动。
+          这一版主要修剧集：
 
-          功能与 v1.12 相同：撤销上次改名、同名电影多版本合并和重复报告、合并季文件夹、剧集集数检查、「需要确认」标签（可按类型筛选、表头可排序）、导出表格。
+          - 修复：同一部剧的各季文件夹被当成「重复影片」（v1.11–v1.13 的自动模式下合并季没有生效）。现在会并进「剧名/Season NN」；分季文件夹永远不会再被当成重复电影
+          - 以后新加的一季（如 老友记第九季）会并进已经刮削好的剧目录；同一季有两份时整组不动，写明原因
+          - 剧集名字里的年份是那一季的年份（Friends.S07.2000），带年份搜不到时自动去掉年份再搜
+          - 中英双语文件夹名（切尔诺贝利 Chernobyl）只要一半和 TMDB 标题一致就算匹配
+          - 收进 Season 文件夹时，海报、tvshow.nfo 等剧集级文件留在剧目录顶层
+          - 修复：重复运行时 tmdb.html 被记成「新建」，导致「撤销上次改名」撤错了那一次
+          - 只保留自动模式（电影和剧集一起识别），删掉单独的电影/剧集模式及其代码
+          - 「重复影片」提示写明「未改动」：程序从不删除任何文件
           '@
           gh release create "${{ inputs.tag }}" dist\TMDB-scrape-rename.exe --title "${{ inputs.tag }}" --notes "$notes" --target "${{ github.sha }}"
