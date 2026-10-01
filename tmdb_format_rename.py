@@ -2113,6 +2113,12 @@ def _title_similarity(q: str, r: dict, region: dict | None = None) -> float:
     qn = _norm_match_title(q or "")
     if not qn or not isinstance(r, dict):
         return 0.0
+    # A bilingual folder name ("切尔诺贝利 Chernobyl") is exact when either half is exactly a TMDB title.
+    exact = {qn}
+    cjk = _norm_match_title(re.sub(r"[A-Za-z0-9 ._\-:'’&]+", " ", q or ""))
+    latin = _norm_match_title(re.sub(r"[^\x00-\x7f]+", " ", q or ""))
+    if cjk and latin and len(cjk) >= 2 and len(latin) >= 2:
+        exact.update((cjk, latin))
     best = 0.0
     for k in ("title", "name", "original_title", "original_name"):
         raw = r.get(k) or ""
@@ -2120,7 +2126,7 @@ def _title_similarity(q: str, r: dict, region: dict | None = None) -> float:
             tn = _norm_match_title(cand)
             if not tn:
                 continue
-            if tn == qn:
+            if tn in exact:
                 return 1.0
             best = max(best, difflib.SequenceMatcher(None, qn, tn).ratio())
     return best
@@ -2208,7 +2214,7 @@ def _uncertain_note(q: str, year, chosen_tid, chosen_kind: str, cand_lists: list
                 continue
             if tid == str(chosen_tid) and kind == chosen_kind:
                 chosen_r = r
-            elif _title_similarity(q, r, region) >= 1.0:
+            elif _title_similarity(q, r, region) >= 1.0 and (not prefer_kind or kind == prefer_kind):
                 yr = str(r.get("release_date") or r.get("first_air_date") or "")[:4]
                 others.append(f"{'电影' if kind == 'movie' else '剧集'}《{r.get('title') or r.get('name') or ''}》({yr or '?'}) [tmdbid={tid}]")
     sim = 1.0
@@ -3706,13 +3712,13 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
         leaf["media"] = "tv" if media_is_tv() else "movie"
         leaf["id_from"] = "nfo"
         return True
-    year = leaf.get("_year_override") or extract_year(leaf["name"])
-    if not year and meta.get("year"):
+    year = None if leaf.get("_ignore_year") else (leaf.get("_year_override") or extract_year(leaf["name"]))
+    if not year and not leaf.get("_ignore_year") and meta.get("year"):
         y = str(meta.get("year"))[:4]
         if y.isdigit():
             year = y
     stems = _leaf_video_stems(folder)
-    if not year:
+    if not year and not leaf.get("_ignore_year"):
         year = year_from_stems(stems)
         if year:
             leaf["year_from"] = "files"
@@ -3858,6 +3864,15 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                         cent.get("tv_tmdb"), cent.get("tv_title") or "",
                     )) + (" | " + candidates_note(cent.get("candidates")) if cent.get("candidates") else ""),
                 }
+    if year and not leaf.get("_ignore_year") and _SEASON_TOKENS.search(leaf.get("name") or ""):
+        # The year in a season release name is that season's year (Friends.S07.2000), not the
+        # show's first-air year (1994), so a year-filtered search can miss the show. Ask again
+        # without the year; keep the first outcome if that does not settle it.
+        probe = dict(leaf)
+        probe["_ignore_year"] = True
+        if resolve_leaf_id(probe, search_cache):
+            leaf.update(probe)
+            return True
     if pending is not None:
         leaf.update(pending)
         leaf["search_year"] = year
@@ -5432,6 +5447,11 @@ def apply_version_names(folder: Path, base: str, label: str, video_names: list) 
                 _rename_one(sc, sdst)
 
 
+def _is_tv_leaf(L: dict) -> bool:
+    """A TV show folder: stamped tv in automatic mode, or any folder in a TV-only run."""
+    return L.get("media") == "tv" or (media_is_tv() and L.get("media") != "movie")
+
+
 def tv_counts(tid: str, cache: dict) -> dict | None:
     """{"seasons": n, "episodes": n, "per": {season: episodes}} of a TMDB show (cached 14 days)."""
     ck = f"tvc:{tid}"
@@ -5968,13 +5988,13 @@ def main():
                 else:
                     multidisc_dest_by_primary[prev_path] = dest
                 continue
-            if not media_is_tv():
+            if not _is_tv_leaf(L):
                 dupgroups.setdefault(key, [prev_path]).append({
                     **L, "target": target, "dest": dest, "title": title,
                     "year": year, "lang": lang, "source": source,
                 })
                 continue
-            if media_is_tv() and MERGE_SEASONS:
+            if _is_tv_leaf(L) and MERGE_SEASONS:
                 dupgroups.setdefault(key, [prev_path]).append({
                     **L, "target": target, "dest": dest, "title": title,
                     "year": year, "lang": lang, "source": source,
@@ -6041,7 +6061,7 @@ def main():
             for m in members[1:]:
                 skip.append({**m, "reason": "dest_exists"})
             continue
-        if media_is_tv():
+        if _is_tv_leaf(prim):
             p_recs, s_recs = resolve_season_group(prim, members[1:])
             plan.extend(p_recs)
             skip.extend(s_recs)
