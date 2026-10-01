@@ -518,6 +518,14 @@ BARE_ID_RE = re.compile(r"^\d{3,}$")  # folder name is only digits
 YEAR_RE = re.compile(
     rf"(?:^|[^\d]|{_META_OPEN}){_META_SEP}((?:19|20)\d{{2}})(?:{_META_SEP}(?:{_META_CLOSE})|(?=[^\d]|$))"
 )
+def strip_tmdb_markers(s: str) -> str:
+    """Remove [tmdbid=N] / tmdbid=N / [12345] from a name. An id between 1900 and 2099
+    (怒火攻心 (2006) [tmdbid=1948]) must never be read as a release year."""
+    s = TMDB_RE.sub(" ", s or "")
+    s = TMDB_EQ_RE.sub(" ", s)
+    return BRACKET_ID_RE.sub(" ", s)
+
+
 HAN_RE = re.compile(r"[\u4e00-\u9fff]")
 KANA_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
 LATIN_RE = re.compile(r"[A-Za-z]")
@@ -1347,7 +1355,7 @@ def extract_year(name: str):
     s = name or ""
     if re.search(r"(?:19|20)\d{2}\s*[–—\-]\s*(?:19|20)\d{2}", s):
         return None
-    years = YEAR_RE.findall(s)
+    years = YEAR_RE.findall(strip_tmdb_markers(s))
     if not years:
         return None
     return years[-1]
@@ -1658,6 +1666,8 @@ def extract_search_queries(name: str) -> list[str]:
     # everything before the release year, if it holds a lone number token.
     _num_title = ""
     _yms = list(YEAR_RE.finditer(raw))
+    if _yms and TMDB_RE.search(raw):
+        _yms = []  # an id like [tmdbid=1948] is not a year
     if _yms:
         _pre = re.sub(r"[._]+", " ", raw[: _yms[-1].start(1)])
         _pre = re.sub(r"[\s\(\[【（\-]+$", "", _pre).strip()
@@ -2115,6 +2125,7 @@ def folder_title_components(name: str) -> list[str]:
     """
     n = strip_season_tokens(strip_site_tags(name or ""))
     n = re.sub(r"\.(mkv|mp4|iso|ts|m2ts|avi|mov|wmv)$", "", n, flags=re.I)
+    n = strip_tmdb_markers(n)
     years = list(YEAR_RE.finditer(n))
     cut = years[-1].start(1) if years else len(n)
     tm = _TECH_CUT_RE.search(n)
@@ -3592,6 +3603,11 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                     tv_t or "?",
                     tv_s,
                 )
+                # Both are offered in the picker (double-click in 未能匹配).
+                leaf["candidates"] = [
+                    {"media": "movie", "tmdb": str(tid0), "title": mv_t, "original": "", "year": "", "country": "", "lang": ""},
+                    {"media": "tv", "tmdb": str(tid0), "title": tv_t, "original": "", "year": "", "country": "", "lang": ""},
+                ]
                 leaf["tmdb"] = None
                 return False
             leaf["id_from"] = "no_tmdb_id"
@@ -3644,6 +3660,11 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                     tv_t or "?",
                     tv_s,
                 )
+                # Both are offered in the picker (double-click in 未能匹配).
+                leaf["candidates"] = [
+                    {"media": "movie", "tmdb": str(tid), "title": mv_t, "original": "", "year": "", "country": "", "lang": ""},
+                    {"media": "tv", "tmdb": str(tid), "title": tv_t, "original": "", "year": "", "country": "", "lang": ""},
+                ]
                 leaf["tmdb"] = None
                 return False
             leaf["id_from"] = "no_tmdb_id"
@@ -4713,7 +4734,7 @@ def _title_scores_for_id(tid: str, folder_name: str) -> tuple[int, int, str, str
     except Exception:
         folder_year = None
     if not folder_year:
-        m = re.search(r"(?:^|[^\d])((?:19|20)\d{2})(?:[^\d]|$)", folder_name)
+        m = re.search(r"(?:^|[^\d])((?:19|20)\d{2})(?:[^\d]|$)", strip_tmdb_markers(folder_name))
         if m:
             folder_year = m.group(1)
     if folder_year:
