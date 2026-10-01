@@ -97,20 +97,26 @@ class _LineWriter:
     def __init__(self, emit):
         self._emit = emit
         self._buf = ""
+        self._lock = threading.Lock()  # the engine prints from several worker threads
 
     def write(self, s):
         if not s:
             return 0
-        self._buf += str(s)
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
+        lines = []
+        with self._lock:
+            self._buf += str(s)
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                lines.append(line)
+        for line in lines:
             self._emit(line)
         return len(s)
 
     def flush(self):
-        if self._buf:
-            self._emit(self._buf)
-            self._buf = ""
+        with self._lock:
+            rest, self._buf = self._buf, ""
+        if rest:
+            self._emit(rest)
 
 
 REASON_ZH = {
