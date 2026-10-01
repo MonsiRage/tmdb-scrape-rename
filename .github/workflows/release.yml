@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v1.7"
+        description: "Release tag, e.g. v1.8"
         required: true
-        default: "v1.7"
+        default: "v1.8"
 
 permissions:
   contents: write
@@ -37,15 +37,13 @@ jobs:
           $notes = @'
           Windows 可执行版。不需要安装 Python，也不需要旁边的 .py。
 
-          这一版主要是防错配和剧集支持：
+          这一版处理同名撞车，并补上一批识别问题：
 
-          - 搜到的标题和文件夹名对不上（只有年份或个别词对上）时，不再直接改名，列入「未能匹配」并写明原因和候选；勾选「同时改名不确定的」才会改
-          - 文件夹名里的完整标题必须和 TMDB 标题一致（It.Boy 不会再被配成 Boy），中文版本标签（如「（瑞典版）」）会一起搜索
-          - 剧集：`Season 01`、`S02`、`第一季` 子文件夹的剧，按剧文件夹识别；分集文件不再被当成散落电影；只写一个 `tvshow.nfo`
-          - 电影和剧集共用同一个编号时（如 40360），各自取各自的资料，不再互相串
-          - 带 `[tmdbid=]` 的文件夹也会判断是电影还是剧集
-          - 去掉中文发布站标签（【高清电影】、[国英双语]）、Extended.Cut、发布组后缀；`2046`、`1917` 这类数字片名能搜到
-          - 近似年份容差收紧为 ±1 年
-          - 图片下载失败会重试 4 次并计入失败
+          - 「未能匹配」里双击一行，可以从候选里选一个（或直接填 TMDB 编号）；选完再点「仅预览」/「确认刮削」就按你的选择处理。候选写明了年份、国家、编号
+          - 文件夹名里的版本词会用来筛同名候选：美版、英版、日版、韩版、瑞典版……，以及 (US) / (UK)、Shameless.US.S01E01 这类写法
+          - 文件夹没写年份时，用里面视频文件名一致的年份
+          - 没写年份的 `WALL-E`、`Wall E` 现在也能找到 `WALL·E`；标题里的空格、连字符、间隔号不再影响比对
+          - 带有「不确定」「候选」说明的条目不会被自动改名，除非勾选「同时改名不确定的」
+          - 上一版的防错配、剧集（Season 子文件夹、tvshow.nfo）、电影/剧集同编号处理都保留
           '@
           gh release create "${{ inputs.tag }}" dist\TMDB-scrape-rename.exe --title "${{ inputs.tag }}" --notes "$notes" --target "${{ github.sha }}"
