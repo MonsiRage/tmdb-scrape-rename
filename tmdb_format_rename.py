@@ -2103,9 +2103,6 @@ def _search_cache_key(q: str, year, prefer_tid: str = "", prefer_kind: str = "",
     return f"{q}|{year or ''}|{mode}|{prefer_tid}|{prefer_kind}|{region_key or ''}|u5"
 
 
-# Set by main() from --accept-uncertain.
-ACCEPT_UNCERTAIN = False
-
 
 def _title_similarity(q: str, r: dict, region: dict | None = None) -> float:
     """1.0 for an exact (normalised) title match, else the best fuzzy ratio over the TMDB titles.
@@ -3204,7 +3201,7 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
             for qtry in uniq:
                 tid, how = search_tmdb(qtry, year, search_cache, prefer_kind=folder_media_hint(d.name))
                 query = qtry
-                if tid and not ACCEPT_UNCERTAIN:
+                if tid:
                     _cent = search_cache.get(_search_cache_key(qtry, year, "", folder_media_hint(d.name) or "")) or {}
                     if _cent.get("uncertain") or (
                         folder_title_mismatch_note(d.name, _cent.get("titles") or [])
@@ -3810,20 +3807,18 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                 # The query builder may have dropped a word of the real title (It Boy -> Boy).
                 note = folder_title_mismatch_note(leaf.get("name") or "", cent.get("titles") or [], region)
             if note:
-                if not ACCEPT_UNCERTAIN:
-                    # A guess: report it, do not rename unless confirmed.
-                    if pending is None:
-                        pending = {
-                            "id_from": "uncertain_title_only",
-                            "reason": "uncertain_title_only",
-                            "note": f"{note} | {candidates_note((cent or {}).get('candidates'))}",
-                            "search_query": query,
-                            "candidate_tmdb": str(tid),
-                            "candidates": (cent or {}).get("candidates") or [],
-                            "uncertain": note,
-                        }
-                    continue
-                leaf["uncertain"] = note
+                # A guess: report it, do not rename unless confirmed.
+                if pending is None:
+                    pending = {
+                        "id_from": "uncertain_title_only",
+                        "reason": "uncertain_title_only",
+                        "note": f"{note} | {candidates_note((cent or {}).get('candidates'))}",
+                        "search_query": query,
+                        "candidate_tmdb": str(tid),
+                        "candidates": (cent or {}).get("candidates") or [],
+                        "uncertain": note,
+                    }
+                continue
             leaf["tmdb"] = tid
             leaf["id_from"] = how
             leaf["search_query"] = query
@@ -5573,7 +5568,7 @@ def check_tv_episodes(leaves: list, cache: dict) -> tuple[list, list]:
         return L, None
 
     for L, flag in _pmap(one, leaves):
-        if flag and not ACCEPT_UNCERTAIN:
+        if flag:
             L2 = dict(L)
             L2.pop("tmdb", None)
             L2.update({
@@ -5669,7 +5664,7 @@ def check_movie_durations(leaves: list, cache: dict) -> tuple[list, list]:
         return L, None
 
     for L, flag in _pmap(one, leaves):
-        if flag and not ACCEPT_UNCERTAIN:
+        if flag:
             L2 = dict(L)
             L2.pop("tmdb", None)
             L2.update({
@@ -5705,8 +5700,6 @@ def main():
     only_new = "--only-new" in args
     global MERGE_SEASONS
     MERGE_SEASONS = "--no-merge-seasons" not in args
-    global ACCEPT_UNCERTAIN
-    ACCEPT_UNCERTAIN = "--accept-uncertain" in args
     media = "auto"
     if "--tv" in args or "--media=tv" in args:
         media = "tv"
@@ -5722,7 +5715,7 @@ def main():
     args = [
         a
         for a in args
-        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--accept-uncertain", "--no-merge-seasons", "--tv", "--media=tv", "--media=movie", "--media=auto")
+        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--no-merge-seasons", "--tv", "--media=tv", "--media=movie", "--media=auto")
         and not a.startswith("--media=")
     ]
     if not args:

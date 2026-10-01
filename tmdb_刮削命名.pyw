@@ -255,15 +255,9 @@ class App(tk.Tk):
             scope,
             text="勾选后，跳过名字里已有 [tmdbid=] 的文件夹。取消勾选，则整库重新检查。",
         ).pack(anchor="w", padx=28, pady=(0, 4))
-        self.accept_uncertain_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            scope,
-            text="同时改名「不确定」的匹配",
-            variable=self.accept_uncertain_var,
-        ).pack(anchor="w", padx=8)
         ttk.Label(
             scope,
-            text="标题对不上、没写年份又有同名候选、或剧集/电影类型对不上的，默认不改名，列在「需要确认」里并写明原因和候选。先预览确认，再勾选。",
+            text="标题对不上、没写年份又有同名候选、或剧集/电影类型对不上的，默认不改名，列在「需要确认」里并写明原因和候选。在那个标签里双击一行，选对的那个再跑。",
         ).pack(anchor="w", padx=28, pady=(0, 8))
 
         fmt = ttk.LabelFrame(top, text="自动整理")
@@ -324,15 +318,6 @@ class App(tk.Tk):
         except Exception:
             self._only_new = True
 
-    def _sync_accept_uncertain(self) -> None:
-        var = getattr(self, "accept_uncertain_var", None)
-        if var is None:
-            return
-        try:
-            self._accept_uncertain = bool(var.get())
-        except Exception:
-            self._accept_uncertain = False
-
     def _toggle_api_key(self) -> None:
         self._api_key_entry.configure(show="" if self._show_key.get() else "*")
 
@@ -375,7 +360,6 @@ class App(tk.Tk):
             return
         media = "auto"
         self._only_new = bool(self.only_new_var.get()) if getattr(self, "only_new_var", None) is not None else bool(getattr(self, "_only_new", True))
-        self._sync_accept_uncertain()
         only_line = "只处理新文件夹，已有 [tmdbid=] 的会跳过。\n" if self._only_new else ""
         # 仅预览：直接开跑，不弹确认框；正式刮削才确认
         if not preview:
@@ -494,13 +478,6 @@ class App(tk.Tk):
             variable=self.only_new_var,
             command=self._sync_only_new,
         ).pack(side=tk.LEFT, padx=(16, 0))
-        self.accept_uncertain_var = tk.BooleanVar(value=bool(getattr(self, "_accept_uncertain", False)))
-        ttk.Checkbutton(
-            bar,
-            text="同时改名不确定的",
-            variable=self.accept_uncertain_var,
-            command=self._sync_accept_uncertain,
-        ).pack(side=tk.LEFT, padx=(12, 0))
 
         self.btn_stop = ttk.Button(bar, text="停止", command=self._stop)
         self.btn_stop.pack(side=tk.RIGHT)
@@ -1148,9 +1125,6 @@ class App(tk.Tk):
         cli = [str(root), f"--media={media}"]
         if getattr(self, "_only_new", False):
             cli.append("--only-new")
-        self._sync_accept_uncertain()
-        if getattr(self, "_accept_uncertain", False):
-            cli.append("--accept-uncertain")
         if preview:
             cli.append("--preview")
         if cli_override:
