@@ -2949,6 +2949,8 @@ def merge_folder_into(src: Path, dest: Path) -> None:
     """Move all children of src into dest, then remove empty src."""
     if not src.exists():
         return
+    if not dest.exists():
+        _log_op("mkdir", path=str(dest))
     dest.mkdir(parents=True, exist_ok=True)
     try:
         if src.resolve() == dest.resolve():
@@ -2962,6 +2964,7 @@ def merge_folder_into(src: Path, dest: Path) -> None:
     try:
         if src.exists() and not any(src.iterdir()):
             src.rmdir()
+            _log_op("rmdir", path=str(src))
     except Exception:
         pass
 
@@ -3002,6 +3005,7 @@ def flatten_disc_subfolders(folder: Path) -> list[str]:
                         pass
             if sub.exists() and not any(sub.iterdir()):
                 sub.rmdir()
+                _log_op("rmdir", path=str(sub))
         except Exception:
             pass
     return moved
@@ -3145,13 +3149,14 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
             continue
         # Dedicated movie leaf (incl. multi-ISO anthology): never treat as loose,
         # even when the scan root *is* that folder.
-        if is_dedicated_movie_leaf(d):
-            continue
-
         try:
             is_root = d.resolve() == root.resolve()
         except Exception:
             is_root = str(d) == str(root)
+        # A scan root with movie folders in it is a library: one stray video next to
+        # them is a loose video, not "the" movie of that folder.
+        if is_dedicated_movie_leaf(d) and not (is_root and interesting_subdirs(d)):
+            continue
         if not is_root and len(videos) < 2:
             continue
 
@@ -3273,15 +3278,18 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
                         if not dest_dir.exists():
                             Path(long_path(dest_dir)).mkdir(parents=True, exist_ok=True)
                             created = True
+                            _log_op("mkdir", path=str(dest_dir))
                         final_dest = dest_file
                         if Path(long_path(dest_file)).exists():
                             final_dest = dest_dir / f"{vf.stem}_moved{vf.suffix}"
                         shutil.move(long_path(vf), long_path(final_dest))
+                        _log_op("rename", src=str(vf), dst=str(final_dest))
                         for sc in side:  # subtitles / nfo that belong to the video go with it
                             try:
                                 target = dest_dir / sc.name
                                 if not Path(long_path(target)).exists():
                                     shutil.move(long_path(sc), long_path(target))
+                                    _log_op("rename", src=str(sc), dst=str(target))
                             except Exception:
                                 pass
                         rec["action"] = "wrapped"
@@ -3906,6 +3914,7 @@ def _download_bytes(url: str, dest: Path, min_size: int = 500) -> str:
                 except Exception:
                     pass
             tmp.replace(dest)
+            _log_op("create", path=str(dest))
             return "ok"
         except Exception as e:
             last_err = str(e)
@@ -4320,6 +4329,7 @@ def write_tmdb_html(folder: Path, meta: dict, tid: str, preview: bool = False) -
         html = build_tmdb_html(meta, str(tid), folder)
         dest = folder / "tmdb.html"
         dest.write_text(html, encoding="utf-8")
+        _log_op("create", path=str(dest))
         return f"ok:{dest.name}"
     except Exception as e:
         return f"err:{e}"
@@ -4339,6 +4349,7 @@ def write_movie_nfo(folder: Path, meta: dict, tid: str, preview: bool = False, k
             return "would_write_nfo:tvshow.nfo"
         try:
             (folder / "tvshow.nfo").write_text(build_nfo_xml(meta, tid, root="tvshow"), encoding="utf-8")
+            _log_op("create", path=str(folder / "tvshow.nfo"))
             return "ok:tvshow.nfo"
         except Exception as e:
             return f"err:{e}"
@@ -4358,11 +4369,13 @@ def write_movie_nfo(folder: Path, meta: dict, tid: str, preview: bool = False, k
         if not videos:
             dest = folder / "movie.nfo"
             dest.write_text(xml, encoding="utf-8")
+            _log_op("create", path=str(dest))
             written.append(dest.name)
         else:
             for vf in videos:
                 dest = folder / f"{vf.stem}.nfo"
                 dest.write_text(xml, encoding="utf-8")
+                _log_op("create", path=str(dest))
                 written.append(dest.name)
             # Do NOT delete existing movie.nfo — Emby primary; we only write when none existed.
         return "ok:" + ",".join(written)
@@ -4490,10 +4503,111 @@ def apply_artwork_and_nfo(
     return art_stats, nfo_stats, html_stats, samples
 
 
+# ---------------------------------------------------------------------------
+# Change log: every move / rename / created file / removed empty folder of a real
+# run is recorded, so "undo last run" can put things back.
+# ---------------------------------------------------------------------------
+CHANGE_LOG: list = []
+_RUN_STAMP: list = [None]
+_CHANGE_LOCK = threading.Lock()
+
+
+def _log_op(op: str, **kw) -> None:
+    with _CHANGE_LOCK:
+        CHANGE_LOG.append({"op": op, **kw})
+
+
+def history_dir() -> Path:
+    return TOOLS / "history"
+
+
+def save_history(root) -> None:
+    """Write (overwrite) this run's history file. Called after each phase of a real run."""
+    with _CHANGE_LOCK:
+        ops = list(CHANGE_LOG)
+    if not ops:
+        return
+    if _RUN_STAMP[0] is None:
+        _RUN_STAMP[0] = datetime.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        history_dir().mkdir(parents=True, exist_ok=True)
+        path = history_dir() / f"{_RUN_STAMP[0]}.json"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps({"root": str(root), "time": _RUN_STAMP[0], "ops": ops}, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        os.replace(str(tmp), str(path))
+    except Exception as e:
+        print(f"  warn: could not save the change history: {e}", flush=True)
+
+
+def list_history() -> list:
+    d = history_dir()
+    try:
+        return sorted((p for p in d.glob("*.json") if not p.name.endswith(".undone.json")), reverse=True)
+    except Exception:
+        return []
+
+
+def undo_last_run() -> int:
+    """Reverse the newest recorded real run. Returns the number of problems."""
+    files = list_history()
+    if not files:
+        print("没有可以撤销的改名记录。", flush=True)
+        return 0
+    path = files[0]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"读不了改名记录 {path.name}: {e}", flush=True)
+        return 1
+    ops = data.get("ops") or []
+    print(f"撤销 {data.get('time')} 的那一次（{data.get('root')}），共 {len(ops)} 步 ...", flush=True)
+    done = skipped = 0
+    for o in reversed(ops):
+        try:
+            kind = o.get("op")
+            if kind == "create":
+                f = Path(o["path"])
+                if f.is_file():
+                    f.unlink()
+                    done += 1
+            elif kind == "rename":
+                src, dst = Path(o["src"]), Path(o["dst"])
+                if dst.exists() and not src.exists():
+                    src.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(str(dst), str(src))
+                    done += 1
+                else:
+                    skipped += 1
+                    print(f"  跳过（现在的状态和记录不符）: {dst.name} -> {src.name}", flush=True)
+            elif kind == "mkdir":
+                d = Path(o["path"])
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+                    done += 1
+            elif kind == "rmdir":
+                d = Path(o["path"])
+                if not d.exists():
+                    d.mkdir(parents=True, exist_ok=True)
+                    done += 1
+        except Exception as e:
+            skipped += 1
+            print(f"  撤销失败: {o} ({e})", flush=True)
+    try:
+        os.replace(str(path), str(path.with_name(path.stem + ".undone.json")))
+    except Exception:
+        pass
+    print(f"已撤销 {done} 步，跳过 {skipped} 步。", flush=True)
+    return skipped
+
+
 def _rename_one(src: Path, dest: Path) -> None:
     """Rename folder; fall back to cmd ren on WinError 50 (some cloud mounts)."""
     try:
         src.rename(dest)
+        _log_op("rename", src=str(src), dst=str(dest))
         return
     except OSError as e:
         if getattr(e, "winerror", None) != 50 and "not supported" not in str(e).lower():
@@ -4511,6 +4625,7 @@ def _rename_one(src: Path, dest: Path) -> None:
     if r.returncode != 0 or not dest.exists():
         err = (r.stderr or r.stdout or "").strip() or f"cmd ren failed code={r.returncode}"
         raise OSError(err)
+    _log_op("rename", src=str(src), dst=str(dest))
 
 
 def apply_renames(plan):
@@ -5113,6 +5228,11 @@ def main():
     SEARCH_CACHE_PATH = TOOLS / "tmdb_search_cache.json"
     API_KEY = _load_api_key()
     args = [a for a in sys.argv[1:] if a]
+    if "--undo" in args:
+        return 1 if undo_last_run() else 0
+    with _CHANGE_LOCK:
+        CHANGE_LOG.clear()
+    _RUN_STAMP[0] = None
     preview = "--preview" in args or "-n" in args
     no_poster = "--no-poster" in args
     no_nfo = "--no-nfo" in args
@@ -5218,6 +5338,8 @@ def main():
     print("正在整理散落的视频（预览时只显示计划）...", flush=True)
     wrapped = wrap_loose_videos(root, preview=preview)
     print(f"  散落视频整理数 = {len(wrapped)}", flush=True)
+    if not preview:
+        save_history(root)
 
     print("正在扫描剧集文件夹..." if media_is_tv() else "正在扫描电影文件夹...", flush=True)
     tagged, untagged = collect_candidate_dirs(root)
@@ -5554,6 +5676,10 @@ def main():
         "media": MEDIA_KIND,
     }
     save_exists_cache()
+    if not preview:
+        save_history(root)
+        if CHANGE_LOG:
+            print(f"改动已记录，可以用「撤销上次改名」还原（{len(CHANGE_LOG)} 步）。", flush=True)
     log_path = TOOLS / "tmdb_format_rename_last.json"
     log_path.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"详细日志文件: {log_path}", flush=True)
@@ -5566,6 +5692,7 @@ def main():
     else:
         print(f"开始正式改名，共 {len(plan)} 个文件夹...", flush=True)
         ok, fail = apply_renames(plan)
+        save_history(root)
         apply_path = TOOLS / "tmdb_format_rename_apply.json"
         apply_path.write_text(
             json.dumps(
@@ -5678,6 +5805,8 @@ def main():
     print("  · 找不到TMDB编号 = 名称太乱或是剧集/合集盘，未能自动匹配", flush=True)
     print("  · 多个候选且无年份 = 搜到多部同名/相近片，文件夹没写年份，已跳过不猜", flush=True)
     print("  · 已有跳过 = 封面等文件已存在，不会重复下载", flush=True)
+    if not preview:
+        save_history(root)
     return 0 if not fail else 1
 
 
