@@ -4632,7 +4632,7 @@ def apply_renames(plan):
     ok, fail = [], []
     ordered = sorted(
         plan,
-        key=lambda r: 1 if (r.get("action") in ("merge_into", "merge_version")) else 0,
+        key=lambda r: 1 if (r.get("action") in ("merge_into", "merge_version", "merge_season")) else 0,
     )
 
     def _maybe_flatten(rec, dest: Path):
@@ -4661,6 +4661,15 @@ def apply_renames(plan):
                     dest = src if src.exists() else dest
                 flat = flatten_disc_subfolders(dest if dest.exists() else src)
                 ok.append({**rec, "final": str(dest if dest.exists() else src), "note": "flattened", "flattened": len(flat)})
+            elif action == "merge_season":
+                if not src.exists():
+                    fail.append({**rec, "error": "source_missing"})
+                else:
+                    if rec.get("season_no") is not None:
+                        move_into_season(src, dest, rec["season_no"])
+                    else:
+                        merge_folder_into(src, dest)
+                    ok.append({**rec, "final": str(dest), "note": "season_merged"})
             elif action == "merge_version":
                 if not src.exists():
                     fail.append({**rec, "error": "source_missing"})
@@ -4701,6 +4710,8 @@ def apply_renames(plan):
                 else:
                     if str(src) != str(dest):
                         _rename_one(src, dest)
+                    if rec.get("season_wrap") is not None:
+                        wrap_into_season(dest, rec["season_wrap"])
                     if rec.get("version_label"):
                         apply_version_names(dest, rec.get("version_base") or dest.name,
                                             rec["version_label"], rec.get("version_videos") or [])
@@ -4806,6 +4817,7 @@ def _zh_reason(code: str) -> str:
         "empty_query": "标题为空",
         "uncertain_title_only": "不确定：需要确认（未改名）",
         "duplicate_movie": "重复影片（请决定保留哪个）",
+        "season_merge_unclear": "同一部剧的多个文件夹无法合并（请确认）",
     }.get(code or "", code or "?")
 
 
@@ -5182,6 +5194,113 @@ def runtime_fits(duration_min: float, runtime_min: float, edition: bool = False)
     return lo <= duration_min <= hi
 
 
+MERGE_SEASONS = True   # on by default; --no-merge-seasons turns it off
+
+
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _cn_int(t: str) -> int | None:
+    t = (t or "").strip()
+    if t.isdigit():
+        return int(t)
+    if t == "十":
+        return 10
+    if t.startswith("十") and len(t) == 2 and t[1] in _CN_DIGITS:
+        return 10 + _CN_DIGITS[t[1]]
+    if len(t) == 2 and t[1] == "十" and t[0] in _CN_DIGITS:
+        return _CN_DIGITS[t[0]] * 10
+    if len(t) == 3 and t[1] == "十" and t[0] in _CN_DIGITS and t[2] in _CN_DIGITS:
+        return _CN_DIGITS[t[0]] * 10 + _CN_DIGITS[t[2]]
+    return _CN_DIGITS.get(t) if len(t) == 1 else None
+
+
+def season_number_from_name(name: str) -> int | None:
+    """One season number from a folder name (S02, Season 2, 第二季); None for none / ranges / specials."""
+    n = name or ""
+    if re.search(r"(?i)S\d{1,2}\s*[-–~]\s*S?\d{1,2}|Seasons?[\s._]*\d{1,2}\s*[-–~]|Complete[\s._]*Series|全\s*[一二三四五六七八九十\d]+\s*季|第\s*[一二三四五六七八九十\d]+\s*[-–~至到]", n):
+        return None
+    found = set()
+    for m in re.finditer(r"(?i)(?<![A-Za-z0-9])S(\d{1,2})(?![0-9])", n):
+        found.add(int(m.group(1)))
+    for m in re.finditer(r"(?i)Season[\s._]*(\d{1,2})(?![0-9])", n):
+        found.add(int(m.group(1)))
+    for m in re.finditer(r"第\s*([零一二三四五六七八九十两\d]+)\s*季", n):
+        v = _cn_int(m.group(1))
+        if v is not None:
+            found.add(v)
+    return found.pop() if len(found) == 1 and 0 not in found else None
+
+
+def season_folder_name(n: int) -> str:
+    return f"Season {n:02d}"
+
+
+def move_into_season(src: Path, dest: Path, season: int) -> None:
+    """Move everything in src (loose episodes) into dest/Season NN, then drop empty src."""
+    sd = dest / season_folder_name(season)
+    merge_folder_into(src, sd)
+
+
+def wrap_into_season(folder: Path, season: int) -> None:
+    """A show folder that holds one season's episodes loose: put them into Season NN inside it."""
+    sd = folder / season_folder_name(season)
+    kids = [c for c in list(folder.iterdir())
+            if c != sd and not (c.is_dir() and is_season_dir_name(c.name))]
+    if not kids:
+        return
+    if not sd.exists():
+        _log_op("mkdir", path=str(sd))
+    sd.mkdir(exist_ok=True)
+    for c in kids:
+        _rename_one(c, _unique_child_path(sd, c.name))
+
+
+def resolve_season_group(prim: dict, others: list) -> tuple[list, list]:
+    """Folders of the same TV show: put each season under one show folder.
+
+    Returns (plan_records, skip_records). A group is only merged when every folder's season
+    can be read from its name (or it already contains Season subfolders) and no two folders
+    claim the same season; otherwise nothing in the group is moved."""
+    group = [prim] + others
+    seasons = []
+    for r in group:
+        p = Path(r["path"])
+        if r.get("kind") == "tv_show":
+            subs = {x.name.lower() for x in p.iterdir() if x.is_dir() and is_season_dir_name(x.name)} if p.exists() else set()
+            seasons.append(("show", subs))
+        else:
+            n = season_number_from_name(r.get("name") or "")
+            seasons.append(("season", n))
+    bad = [i for i, (k, v) in enumerate(seasons) if k == "season" and v is None]
+    claimed: dict = {}
+    clash = False
+    for k, v in seasons:
+        if k == "season" and v is not None:
+            clash |= v in claimed
+            claimed[v] = True
+    if bad or clash:
+        why = "看不出是第几季" if bad else "有两个文件夹是同一季"
+        return [], [{**r, "reason": "season_merge_unclear", "note": f"同一部剧有多个文件夹，但{why}，未合并"} for r in group]
+    plan = []
+    for i, (r, (k, v)) in enumerate(zip(group, seasons)):
+        r = dict(r)
+        if i == 0:
+            r["reason"] = "season_primary"
+            if k == "season":
+                r["season_wrap"] = v
+            plan.append(r)
+        else:
+            r["action"] = "merge_season"
+            r["dest"] = prim["dest"]
+            r["target"] = prim["target"]
+            r["reason"] = "season_merge"
+            if k == "season":
+                r["season_no"] = v
+            plan.append(r)
+    return plan, []
+
+
 _VERSION_EDITIONS = [
     (r"director'?s?[\s._-]*cut|导演剪辑", "Director's Cut"),
     (r"extended|加长", "Extended"),
@@ -5450,6 +5569,8 @@ def main():
     no_nfo = "--no-nfo" in args
     preview_nfo = "--preview-nfo" in args
     only_new = "--only-new" in args
+    global MERGE_SEASONS
+    MERGE_SEASONS = "--no-merge-seasons" not in args
     global ACCEPT_UNCERTAIN
     ACCEPT_UNCERTAIN = "--accept-uncertain" in args
     media = "auto"
@@ -5467,7 +5588,7 @@ def main():
     args = [
         a
         for a in args
-        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--accept-uncertain", "--tv", "--media=tv", "--media=movie", "--media=auto")
+        if a not in ("--preview", "-n", "--no-poster", "--no-nfo", "--preview-nfo", "--only-new", "--accept-uncertain", "--no-merge-seasons", "--tv", "--media=tv", "--media=movie", "--media=auto")
         and not a.startswith("--media=")
     ]
     if not args:
@@ -5744,6 +5865,12 @@ def main():
                     "year": year, "lang": lang, "source": source,
                 })
                 continue
+            if media_is_tv() and MERGE_SEASONS:
+                dupgroups.setdefault(key, [prev_path]).append({
+                    **L, "target": target, "dest": dest, "title": title,
+                    "year": year, "lang": lang, "source": source,
+                })
+                continue
             n = 2
             while key in used and n <= 30:
                 try:
@@ -5804,6 +5931,11 @@ def main():
             prim = next((r for r in skip if r.get("path") == prim_path), None)
             for m in members[1:]:
                 skip.append({**m, "reason": "dest_exists"})
+            continue
+        if media_is_tv():
+            p_recs, s_recs = resolve_season_group(prim, members[1:])
+            plan.extend(p_recs)
+            skip.extend(s_recs)
             continue
         group = [prim] + members[1:]
         verdict, labels = decide_duplicate_group(group)
