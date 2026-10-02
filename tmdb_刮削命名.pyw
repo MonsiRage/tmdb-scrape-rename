@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TMDB 刮削命名 — 先选电影/剧集，再选预览或确认刮削"""
+"""TMDB 刮削命名 — 选目录，预览或确认刮削（电影和剧集一起识别）"""
 from __future__ import annotations
 
 import json
@@ -23,10 +23,7 @@ def app_dir() -> Path:
 
 
 def find_tools_dir() -> Path:
-    here = app_dir()
-    if (here / "tmdb_format_rename.py").is_file():
-        return here
-    return here
+    return app_dir()
 
 
 def default_root(tools: Path) -> Path:
@@ -96,10 +93,11 @@ def read_saved_api_key() -> str:
 
 
 def last_history() -> dict | None:
-    """The newest change-history file of a real run (what 撤销上次改名 would undo)."""
+    """The newest change-history file of a real run (what 撤销上次改名 would undo).
+    Runs already undone (*.undone.json) are skipped, as the engine skips them."""
     d = data_dir() / "history"
     try:
-        files = sorted(d.glob("*.json"))
+        files = sorted(f for f in d.glob("*.json") if not f.name.endswith(".undone.json"))
     except Exception:
         return None
     for f in reversed(files):
@@ -214,11 +212,12 @@ class App(tk.Tk):
         self.tools = find_tools_dir()
         self.script = self.tools / "tmdb_format_rename.py"
         self.proc = None
+        self._busy = False  # a run (or an undo) is going; the exe runs it in this process
         self._scan_root: Path | None = None
         self._last_was_preview = False
         self._only_new = True
         self._build_chooser()
-        self._stop_flag = False
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         if not engine_ready(self.script):
             messagebox.showerror(
                 "缺少引擎",
@@ -287,12 +286,6 @@ class App(tk.Tk):
             foreground="#666",
         ).pack(anchor="w", pady=(0, 8))
 
-        ttk.Label(
-            top,
-            text="每次同时搜索电影与剧集：只命中一边进对应标签；重复或刮削不到的都进「需要确认」（说明写在行内）。",
-            foreground="#666",
-        ).pack(anchor="w", pady=(0, 8))
-
         btns = ttk.Frame(top)
         btns.pack(fill=tk.X, pady=(4, 8))
         ttk.Button(
@@ -301,7 +294,7 @@ class App(tk.Tk):
         ttk.Button(
             btns, text="确认刮削（正式更改）", command=lambda: self._choose(False)
         ).pack(side=tk.LEFT, padx=(0, 12), ipadx=10, ipady=8)
-        ttk.Button(btns, text="退出", command=self.destroy).pack(side=tk.RIGHT, ipadx=10, ipady=8)
+        ttk.Button(btns, text="退出", command=self._on_close).pack(side=tk.RIGHT, ipadx=10, ipady=8)
         ttk.Button(btns, text="撤销上次改名", command=self._undo).pack(side=tk.RIGHT, padx=(0, 12), ipadx=10, ipady=8)
         ttk.Label(top, text=f"数据目录: {data_dir()}", foreground="#666").pack(
             anchor="w", pady=(10, 0)
@@ -370,7 +363,7 @@ class App(tk.Tk):
                 (
                     f"模式: 正式更改\n目录: {root}\n\n"
                     f"{only_line}"
-                    "两边都命中的会进失败栏，不改名。确定开始？"
+                    "拿不准的会列进「需要确认」，不改名。确定开始？"
                 ),
             )
             if not ok:
@@ -665,17 +658,21 @@ class App(tk.Tk):
         messagebox.showinfo("已记住", "已记住你的选择。\n再点一次「仅预览」或「确认刮削」，这个文件夹就会按它处理。")
 
     @staticmethod
-    def _change_label(rec: dict, base: str) -> str:
+    def _season_text(n) -> str:
+        return "Specials" if n == 0 else f"Season {n:02d}"
+
+    @classmethod
+    def _change_label(cls, rec: dict, base: str) -> str:
         act = rec.get("action") or ""
         if act == "merge_version":
             return f"{base}·合并版本 [{rec.get('version_label') or ''}]"
         if act == "merge_season":
             n = rec.get("season_no")
-            return f"{base}·并入 Season {n:02d}" if n is not None else f"{base}·并入剧目录"
+            return f"{base}·并入 {cls._season_text(n)}" if n is not None else f"{base}·并入剧目录"
         if rec.get("version_label"):
             return f"{base}·版本 [{rec['version_label']}]"
         if rec.get("season_wrap") is not None:
-            return f"{base}·整理为 Season {rec['season_wrap']:02d}"
+            return f"{base}·整理为 {cls._season_text(rec['season_wrap'])}"
         return base
 
     def _refill_unmatched(self) -> None:
@@ -688,7 +685,7 @@ class App(tk.Tk):
         self.notebook.tab(1 + order.index("unmatched"), text=f"需要确认 ({n})")
 
     def _undo(self) -> None:
-        if self.proc and self.proc.poll() is None:
+        if self._busy:
             messagebox.showwarning("忙", "请先等待当前任务结束。")
             return
         h = last_history()
@@ -707,7 +704,6 @@ class App(tk.Tk):
             return
         self._last_was_preview = True
         self._show_runner(Path(h.get("root") or "."), True, ["--undo"])
-        self.btn_undo.configure(state=tk.DISABLED)
 
     def _export_csv(self) -> None:
         d = getattr(self, "_export_data", None)
@@ -730,7 +726,7 @@ class App(tk.Tk):
                 status = {"merge_version": "已合并版本", "merge_season": "已合并到季"}.get(act, "已改名" if p.get("path") in done else "待改名")
             rows.append([status, "剧集" if guess_lib_kind(p) == "tv" else "电影", p.get("name") or "",
                          p.get("target") or "", p.get("tmdb") or "",
-                         p.get("version_label") or (f"Season {p['season_no']:02d}" if p.get("season_no") is not None else ""),
+                         p.get("version_label") or (self._season_text(p["season_no"]) if p.get("season_no") is not None else ""),
                          p.get("version_info") or "", ""])
         for r in d["um"]:
             it = r[4] if len(r) >= 5 and isinstance(r[4], dict) else {}
@@ -756,7 +752,7 @@ class App(tk.Tk):
             messagebox.showerror("导出失败", str(e))
 
     def _confirm_apply(self) -> None:
-        if self.proc and self.proc.poll() is None:
+        if self._busy:
             messagebox.showwarning("忙", "请先等待当前任务结束。")
             return
         root = self._scan_root
@@ -1044,7 +1040,7 @@ class App(tk.Tk):
         self.notebook.select(1)
 
     def _restart(self) -> None:
-        if self.proc and self.proc.poll() is None:
+        if self._busy:
             messagebox.showwarning("忙", "请先停止当前任务。")
             return
         for w in self.winfo_children():
@@ -1088,8 +1084,9 @@ class App(tk.Tk):
         self.btn_again.configure(state=tk.DISABLED)
         self.btn_reload.configure(state=tk.DISABLED)
         self.btn_apply.configure(state=tk.DISABLED)
+        self.btn_undo.configure(state=tk.DISABLED)
         self.btn_stop.configure(state=tk.NORMAL)
-        self._stop_flag = False
+        self._busy = True
 
         def worker() -> None:
             try:
@@ -1144,6 +1141,7 @@ class App(tk.Tk):
                 self.after(0, self._log, f"ERROR: {e}")
             finally:
                 self.proc = None
+                self.after(0, self._run_finished)
                 self.after(0, self.btn_stop.configure, {"state": tk.DISABLED})
                 self.after(0, self.btn_again.configure, {"state": tk.NORMAL})
                 self.after(0, self.btn_reload.configure, {"state": tk.NORMAL})
@@ -1154,10 +1152,40 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _run_finished(self) -> None:
+        self._busy = False
+        try:
+            self.btn_undo.configure(state=tk.NORMAL)
+        except Exception:
+            pass
+
     def _stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            self._log("已请求停止…")
+        """Ask the engine to stop at its next step (works for the exe and the .pyw alike).
+        What was already changed stays recorded, so 撤销上次改名 can still undo it."""
+        if not self._busy:
+            return
+        try:
+            (data_dir() / "stop.request").write_text("stop", encoding="utf-8")
+        except Exception as e:
+            self._log(f"无法请求停止: {e}")
+            return
+        self.btn_stop.configure(state=tk.DISABLED)
+        self._log("已请求停止…（做完手上这一步就停，已做的改动可以撤销）")
+
+    def _on_close(self) -> None:
+        if not self._busy:
+            self.destroy()
+            return
+        if not messagebox.askyesno("正在运行", "任务还在进行。先停止再退出？\n（已做的改动会记录下来，可以撤销）"):
+            return
+        self._stop()
+        self._close_when_idle()
+
+    def _close_when_idle(self) -> None:
+        if self._busy:
+            self.after(300, self._close_when_idle)
+        else:
+            self.destroy()
 
 
 def main() -> None:
