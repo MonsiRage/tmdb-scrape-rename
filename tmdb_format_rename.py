@@ -159,27 +159,25 @@ def looks_like_tv_name(name: str) -> bool:
 # Type / year / id wrappers: spaces, dashes, underscores, dots, brackets
 _HINT_WRAP = r"[\s\-_.·•〜～—–\[\]\(\)（）【】]*"
 
+# English type words (Show, Movie, Series, Film, Cinema, TV) are often part of a title
+# (The Truman Show, Scary Movie, Cinema Paradiso), so on their own they only count when
+# bracketed: "Friends (TV)", "[Movie]". "TV Series" / "TV Show" count anywhere.
+_EN_OPEN = r"[\[\(（【]\s*"
+_EN_CLOSE = r"\s*[\]\)）】]"
+_EN_TV_WORDS = r"(?<![A-Za-z])TV[\s._-]*(?:Series|Show)(?![A-Za-z])|" + _EN_OPEN + r"(?:TV|Series|Show)" + _EN_CLOSE
+_EN_MOVIE_WORDS = _EN_OPEN + r"(?:Movie|Film|Cinema)" + _EN_CLOSE
+_CN_TV_WORDS = r"电视剧|電視劇|电视连续剧|電視連續劇|剧集|劇集|网剧|網劇|连续剧|連續劇"
+_CN_MOVIE_WORDS = r"电影|電影|影片|剧场版|劇場版"
+
 _MEDIA_HINT_TV = re.compile(
-    rf"(?i)(?:{_HINT_WRAP})(?:"
-    r"电视剧|電視劇|电视连续剧|電視連續劇|剧集|劇集|网剧|網劇|连续剧|連續劇|"
-    r"TV\s*Series|TV\s*Show|(?<![A-Za-z])TV(?![A-Za-z])|(?<![A-Za-z])Series(?![A-Za-z])|(?<![A-Za-z])Show(?![A-Za-z])|"
+    rf"(?i)(?:{_HINT_WRAP})(?:{_CN_TV_WORDS}|"
     r"第\s*[0-9一二三四五六七八九十百]+\s*季|"
-    r"(?<![A-Za-z])S\d{{1,2}}(?![A-Za-z0-9])|(?<![A-Za-z])Season\s*\d+(?![A-Za-z0-9])"
-    rf")(?:{_HINT_WRAP})"
+    r"(?<![A-Za-z])S\d{1,2}(?![A-Za-z0-9])|(?<![A-Za-z])Season\s*\d+(?![A-Za-z0-9])"
+    rf")(?:{_HINT_WRAP})|{_EN_TV_WORDS}"
 )
-_MEDIA_HINT_MOVIE = re.compile(
-    rf"(?i)(?:{_HINT_WRAP})(?:"
-    r"电影|電影|影片|剧场版|劇場版|"
-    r"(?<![A-Za-z])Movie(?![A-Za-z])|(?<![A-Za-z])Film(?![A-Za-z])|(?<![A-Za-z])Cinema(?![A-Za-z])"
-    rf")(?:{_HINT_WRAP})"
-)
+_MEDIA_HINT_MOVIE = re.compile(rf"(?i)(?:{_HINT_WRAP})(?:{_CN_MOVIE_WORDS})(?:{_HINT_WRAP})|{_EN_MOVIE_WORDS}")
 _MEDIA_HINT_STRIP = re.compile(
-    rf"(?i){_HINT_WRAP}(?:"
-    r"电视剧|電視劇|电视连续剧|電視連續劇|剧集|劇集|网剧|網劇|连续剧|連續劇|"
-    r"电影|電影|影片|剧场版|劇場版|"
-    r"TV\s*Series|TV\s*Show|(?<![A-Za-z])TV(?![A-Za-z])|(?<![A-Za-z])Series(?![A-Za-z])|(?<![A-Za-z])Show(?![A-Za-z])|"
-    r"(?<![A-Za-z])Movie(?![A-Za-z])|(?<![A-Za-z])Film(?![A-Za-z])|(?<![A-Za-z])Cinema(?![A-Za-z])"
-    rf"){_HINT_WRAP}"
+    rf"(?i){_HINT_WRAP}(?:{_CN_TV_WORDS}|{_CN_MOVIE_WORDS}){_HINT_WRAP}|{_EN_TV_WORDS}|{_EN_MOVIE_WORDS}"
 )
 _HINT_ONLY = re.compile(
     r"^(?:电视剧|電視劇|剧集|劇集|网剧|網劇|连续剧|連續劇|电影|電影|影片|剧场版|劇場版|"
@@ -189,13 +187,13 @@ _HINT_ONLY = re.compile(
 
 
 # Season / episode markers that are not part of a title: S01, S01-S02, S01E02,
-# Season 1, 第一季, 全3季. (Only 季: 第2部 can be a movie sequel.)
+# Season 1, 第一季, 全3季, Specials / 特别篇. (Only 季: 第2部 can be a movie sequel.)
 _SEASON_TOKENS = re.compile(
     r"(?i)(?<![A-Za-z0-9])(?:S\d{1,2}(?:[\s._]*[-–~][\s._]*S?\d{1,2})?"
     r"(?:[\s._]*E\d{1,3}(?:[\s._]*[-–~]?[\s._]*E?\d{1,3})?)?"
-    r"|Seasons?[\s._]*\d{1,2}(?:[\s._]*[-–~][\s._]*\d{1,2})?|Complete[\s._]*Series)(?![A-Za-z0-9])"
+    r"|Seasons?[\s._]*\d{1,2}(?:[\s._]*[-–~][\s._]*\d{1,2})?|Complete[\s._]*Series|Specials)(?![A-Za-z0-9])"
     r"|第\s*[一二三四五六七八九十百零两\d]+(?:\s*[-–~至到]\s*[一二三四五六七八九十百零两\d]+)?\s*季"
-    r"|全\s*[一二三四五六七八九十\d]+\s*季"
+    r"|全\s*[一二三四五六七八九十\d]+\s*季|特别篇|特典"
 )
 
 
@@ -552,6 +550,38 @@ _REQ_TIMES: list[float] = []
 _PACE_LOCK = threading.Lock()
 
 
+class RunStopped(Exception):
+    """The user pressed 停止: unwind, keep what is done, save the change record."""
+
+
+# 停止 works the same for the exe (engine in the GUI process) and the .pyw (engine in a
+# child process): the GUI drops a file into the data folder; the engine looks for it
+# before every TMDB request and between file moves.
+_STOP_STATE = {"set": False, "checked": 0.0}
+
+
+def stop_request_path() -> Path:
+    return TOOLS / "stop.request"
+
+
+def stop_requested() -> bool:
+    if _STOP_STATE["set"]:
+        return True
+    now = time.monotonic()
+    if now - _STOP_STATE["checked"] >= 0.3:
+        _STOP_STATE["checked"] = now
+        try:
+            _STOP_STATE["set"] = stop_request_path().exists()
+        except OSError:
+            pass
+    return _STOP_STATE["set"]
+
+
+def _check_stop() -> None:
+    if stop_requested():
+        raise RunStopped()
+
+
 def _pace_requests() -> None:
     """Sliding window, safe to call from several threads.
 
@@ -560,6 +590,7 @@ def _pace_requests() -> None:
     """
     window = 1.0
     limit = 40
+    _check_stop()
     while True:
         with _PACE_LOCK:
             now = time.monotonic()
@@ -584,8 +615,11 @@ def _pmap(fn, items):
     items = list(items)
     if WORKERS <= 1 or len(items) <= 1:
         return [fn(x) for x in items]
-    with ThreadPoolExecutor(max_workers=min(WORKERS, len(items))) as ex:
+    ex = ThreadPoolExecutor(max_workers=min(WORKERS, len(items)))
+    try:
         return list(ex.map(fn, items))
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)  # after 停止 / an error: drop what has not started
 
 
 # HTTP with connection reuse. urllib opens a new TLS connection (and rebuilds the CA
@@ -887,7 +921,8 @@ def cache_needs_refetch(entry: dict) -> bool:
     if not entry or not entry.get("ok") or not entry.get("picked_title"):
         return True
     if not entry.get("poster_path"):
-        return True
+        # TMDB may simply have no poster: look again after a week, not on every run.
+        return time.time() - float(entry.get("ts") or 0) > 7 * 86400
     art = entry.get("art")
     if not isinstance(art, dict):
         return True
@@ -1260,6 +1295,7 @@ def fetch_movie(tid: str, cache: dict, force: bool = False, kind: str | None = N
         "trailer": trailer,
         "tvdb_id": tvdb_id,
         "nfo_ver": 3,
+        "ts": time.time(),
     }
     if not picked:
         cache[ck]["ok"] = False
@@ -1502,7 +1538,7 @@ def extract_search_queries(name: str) -> list[str]:
 
     Tries Chinese bracket titles, Latin show/movie names, then a cleaned full string.
     """
-    name = strip_season_tokens(strip_site_tags(name or ""))
+    name = strip_media_hint_tokens(strip_season_tokens(strip_site_tags(name or "")))
     # collapse_dotted_acronym
     # leading_num_title_query: 3.from.Hell -> 3 from Hell
     name = re.sub(r"^(\d{1,2})[._\- ]+(?=[A-Za-z])", r"\1 ", (name or "").strip())
@@ -2024,7 +2060,18 @@ def _search_cache_key(q: str, year, prefer_tid: str = "", prefer_kind: str = "",
     prefer_kind = str(prefer_kind or "").strip().lower()
     if prefer_kind not in ("movie", "tv"):
         prefer_kind = ""
-    return f"{q}|{year or ''}|{mode}|{prefer_tid}|{prefer_kind}|{region_key or ''}|u5"
+    return f"{q}|{year or ''}|{mode}|{prefer_tid}|{prefer_kind}|{region_key or ''}|{_SEARCH_CACHE_VER}"
+
+
+# Bump when matching rules change: a cached answer (and its "uncertain" note) was made by
+# the old rules. Entries of older versions are dropped when the cache is loaded.
+_SEARCH_CACHE_VER = "u6"
+
+
+def load_search_cache() -> dict:
+    data = load_json(SEARCH_CACHE_PATH)
+    tail = "|" + _SEARCH_CACHE_VER
+    return {k: v for k, v in data.items() if k.endswith(tail)}
 
 
 
@@ -2897,15 +2944,7 @@ def flatten_disc_subfolders(folder: Path) -> list[str]:
             _rename_one(child, target)
             moved.append(str(target))
         try:
-            # drop tiny leftover nfo/txt junk then rmdir
-            for leftover in list(sub.iterdir()):
-                if leftover.is_file() and leftover.suffix.lower() in {
-                    ".nfo", ".txt", ".jpg", ".png", ".jpeg", ".url"
-                } and leftover.stat().st_size < 200_000:
-                    try:
-                        leftover.unlink()
-                    except Exception:
-                        pass
+            # Remove the disc folder only when everything came out; never delete files.
             if sub.exists() and not any(sub.iterdir()):
                 sub.rmdir()
                 _log_op("rmdir", path=str(sub))
@@ -3012,7 +3051,7 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
     except Exception:
         pass
     wrapped = []
-    search_cache = load_json(SEARCH_CACHE_PATH)
+    search_cache = load_search_cache()
     meta_cache = load_json(CACHE_PATH)  # loaded once, saved once: it can be large
     meta_cache_dirty = False
     stack = [root]
@@ -3184,7 +3223,7 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
                             _log_op("mkdir", path=str(dest_dir))
                         final_dest = dest_file
                         if Path(long_path(dest_file)).exists():
-                            final_dest = dest_dir / f"{vf.stem}_moved{vf.suffix}"
+                            final_dest = _unique_child_path(dest_dir, vf.name)  # never over a file
                         shutil.move(long_path(vf), long_path(final_dest))
                         _log_op("rename", src=str(vf), dst=str(final_dest))
                         for sc in side:  # subtitles / nfo that belong to the video go with it
@@ -3790,6 +3829,7 @@ def _file_ok(path: Path, min_size: int = 200) -> bool:
 def _download_bytes(url: str, dest: Path, min_size: int = 500) -> str:
     if _file_ok(dest, min_size=1):
         return "already_exists"
+    _check_stop()
     tmp = dest.with_suffix(dest.suffix + ".part")
     last_err = ""
     for attempt in range(1, 5):
@@ -4320,9 +4360,9 @@ def apply_artwork_and_nfo(
                 _k = ""
         if _k not in ("movie", "tv"):
             _k = "movie"
-        if meta.get("kind") != _k or not meta.get("picked_title") or not meta.get("poster_path"):
+        if meta.get("kind") != _k or cache_needs_refetch(meta):
             try:
-                meta = fetch_movie(str(tid), cache, force=True, kind=_k)
+                meta = fetch_movie(str(tid), cache, kind=_k)
             except Exception:
                 meta = cache.get(ckey(tid, _k)) or meta
         if isinstance(meta, dict):
@@ -4473,7 +4513,7 @@ def undo_last_run() -> int:
                 src, dst = Path(o["src"]), Path(o["dst"])
                 if dst.exists() and not src.exists():
                     src.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(str(dst), str(src))
+                    _rename_one(dst, src)
                     done += 1
                 else:
                     skipped += 1
@@ -4495,6 +4535,8 @@ def undo_last_run() -> int:
         os.replace(str(path), str(path.with_name(path.stem + ".undone.json")))
     except Exception:
         pass
+    with _CHANGE_LOCK:
+        CHANGE_LOG.clear()  # the moves above are not a run of their own
     print(f"已撤销 {done} 步，跳过 {skipped} 步。", flush=True)
     return skipped
 
@@ -4506,7 +4548,7 @@ def _rename_one(src: Path, dest: Path) -> None:
     renamed (path not found, file in use): wait and try again. Some cloud mounts refuse the
     rename call itself (WinError 50): use cmd's ren / move instead."""
     last = None
-    for attempt in range(4):
+    for attempt in range(3):
         try:
             src.rename(dest)
             _log_op("rename", src=str(src), dst=str(dest))
@@ -4516,8 +4558,9 @@ def _rename_one(src: Path, dest: Path) -> None:
             code = getattr(e, "winerror", None)
             if code == 50 or "not supported" in str(e).lower():
                 break
-            if code in (2, 3, 5, 32) and attempt < 3 and src.exists() and not dest.exists():
-                time.sleep(0.5 * (attempt + 1))
+            # 2/3: path not there yet, 32: in use; 5 (access denied) is usually lasting: one retry.
+            if (code in (2, 3, 32) or (code == 5 and attempt == 0)) and attempt < 2 and src.exists() and not dest.exists():
+                time.sleep(0.4 * (attempt + 1))
                 continue
             raise
     import subprocess
@@ -4533,150 +4576,102 @@ def _rename_one(src: Path, dest: Path) -> None:
     _log_op("rename", src=str(src), dst=str(dest))
 
 
-def apply_renames(plan):
-    ok, fail = [], []
-    ordered = sorted(
-        plan,
-        key=lambda r: 1 if (r.get("action") in ("merge_into", "merge_version", "merge_season")) else 0,
-    )
+_MERGE_ACTIONS = ("merge_into", "merge_version", "merge_season")
 
-    def _maybe_flatten(rec, dest: Path):
-        if rec.get("flatten_discs") or rec.get("kind") == "multidisc_parent":
-            try:
-                moved = flatten_disc_subfolders(dest)
-                return moved
-            except Exception:
-                return []
-        # Also flatten when we just merged disc siblings into dest
-        if rec.get("action") in {"merge_into", "rename_then_merge"} or rec.get("multidisc_merge_from"):
+
+def apply_renames(plan):
+    """Carry out the plan. Plain renames go first, merges into their folders after.
+    A record that fails is tried once more; a source that is already gone counts as done
+    only when an earlier step moved it (never when it was missing from the start)."""
+    ok, fail = [], []
+    ordered = sorted(plan, key=lambda r: 1 if r.get("action") in _MERGE_ACTIONS else 0)
+
+    def flatten(rec, dest: Path) -> list:
+        if (rec.get("flatten_discs") or rec.get("kind") == "multidisc_parent" or rec.get("multidisc_merge_from")
+                or rec.get("action") in ("merge_into", "rename_then_merge")):
             try:
                 return flatten_disc_subfolders(dest)
             except Exception:
                 return []
         return []
 
-    for i, rec in enumerate(ordered, 1):
-        src = Path(rec["path"])
-        dest = Path(rec["dest"])
+    def one(rec) -> dict:
+        """Do one record; returns its ok-entry, raises on failure."""
+        src, dest = Path(rec["path"]), Path(rec["dest"])
         action = (rec.get("action") or "rename").strip()
-        try:
-            if action == "flatten_discs":
-                if not dest.exists():
-                    # after rename path may be src==dest already_ok
-                    dest = src if src.exists() else dest
-                flat = flatten_disc_subfolders(dest if dest.exists() else src)
-                ok.append({**rec, "final": str(dest if dest.exists() else src), "note": "flattened", "flattened": len(flat)})
-            elif action == "merge_season":
-                if not src.exists():
-                    fail.append({**rec, "error": "source_missing"})
-                else:
-                    if rec.get("season_no") is not None:
-                        move_into_season(src, dest, rec["season_no"])
-                    else:
-                        merge_folder_into(src, dest)
-                    ok.append({**rec, "final": str(dest), "note": "season_merged"})
-            elif action == "merge_version":
-                if not src.exists():
-                    fail.append({**rec, "error": "source_missing"})
-                else:
-                    apply_version_names(src, rec.get("version_base") or dest.name,
-                                        rec.get("version_label") or "", rec.get("version_videos") or [])
-                    merge_folder_into(src, dest)
-                    ok.append({**rec, "final": str(dest), "note": "version_merged"})
-            elif action == "merge_into":
-                if not src.exists():
-                    ok.append({**rec, "final": str(dest), "note": "merge_src_missing"})
-                else:
-                    merge_folder_into(src, dest)
-                    flat = _maybe_flatten(rec, dest)
-                    ok.append({**rec, "final": str(dest), "note": "merged", "flattened": len(flat)})
-            elif action == "rename_then_merge" or rec.get("multidisc_merge_from"):
-                if not src.exists():
-                    fail.append({**rec, "error": "source_missing"})
-                else:
-                    if str(src) != str(dest):
-                        if not dest.exists():
-                            _rename_one(src, dest)
-                        else:
-                            try:
-                                if src.resolve() != dest.resolve():
-                                    merge_folder_into(src, dest)
-                            except Exception:
-                                merge_folder_into(src, dest)
-                    for sib in rec.get("multidisc_merge_from") or []:
-                        sp = Path(sib)
-                        if sp.exists():
-                            merge_folder_into(sp, dest)
-                    flat = _maybe_flatten(rec, dest)
-                    ok.append({**rec, "final": str(dest), "flattened": len(flat)})
+        if action == "flatten_discs":
+            folder = dest if dest.exists() else src
+            return {**rec, "final": str(folder), "note": "flattened", "flattened": len(flatten_disc_subfolders(folder))}
+        if not src.exists():
+            if action == "merge_into":
+                return {**rec, "final": str(dest), "note": "merge_src_missing"}
+            raise FileNotFoundError("source_missing")
+        if action == "merge_season":
+            if rec.get("season_no") is not None:
+                move_into_season(src, dest, rec["season_no"])
             else:
-                if not src.exists():
-                    fail.append({**rec, "error": "source_missing"})
+                merge_folder_into(src, dest)
+            return {**rec, "final": str(dest), "note": "season_merged"}
+        if action == "merge_version":
+            apply_version_names(src, rec.get("version_base") or dest.name,
+                                rec.get("version_label") or "", rec.get("version_videos") or [])
+            merge_folder_into(src, dest)
+            return {**rec, "final": str(dest), "note": "version_merged"}
+        if action == "merge_into":
+            merge_folder_into(src, dest)
+            return {**rec, "final": str(dest), "note": "merged", "flattened": len(flatten(rec, dest))}
+        if action == "rename_then_merge" or rec.get("multidisc_merge_from"):
+            if str(src) != str(dest):
+                if not dest.exists():
+                    _rename_one(src, dest)
                 else:
-                    if rec.get("season_wrap") is not None and str(src) != str(dest) and not dest.exists():
-                        move_into_season(src, dest, rec["season_wrap"])
-                    else:
-                        if str(src) != str(dest):
-                            _rename_one(src, dest)
-                        if rec.get("season_wrap") is not None:
-                            wrap_into_season(dest, rec["season_wrap"])
-                    if rec.get("version_label"):
-                        apply_version_names(dest, rec.get("version_base") or dest.name,
-                                            rec["version_label"], rec.get("version_videos") or [])
-                    flat = _maybe_flatten(rec, dest)
-                    ok.append({**rec, "final": str(dest), "flattened": len(flat)})
+                    merge_folder_into(src, dest)
+            for sib in rec.get("multidisc_merge_from") or []:
+                if Path(sib).exists():
+                    merge_folder_into(Path(sib), dest)
+            return {**rec, "final": str(dest), "flattened": len(flatten(rec, dest))}
+        # plain rename (a show's first season may also go into Season NN)
+        if rec.get("season_wrap") is not None:
+            if str(src) != str(dest):
+                move_into_season(src, dest, rec["season_wrap"])
+            else:
+                wrap_into_season(dest, rec["season_wrap"])
+        elif str(src) != str(dest):
+            _rename_one(src, dest)
+        if rec.get("version_label"):
+            apply_version_names(dest, rec.get("version_base") or dest.name,
+                                rec["version_label"], rec.get("version_videos") or [])
+        return {**rec, "final": str(dest), "flattened": len(flatten(rec, dest))}
+
+    for i, rec in enumerate(ordered, 1):
+        if stop_requested():
+            fail.extend({**r, "error": "stopped"} for r in ordered[i - 1:])
+            print(f"  已停止：剩下 {len(ordered) - i + 1} 个没有改。", flush=True)
+            break
+        try:
+            ok.append(one(rec))
         except Exception as e:
-            fail.append({**rec, "error": str(e)})
+            fail.append({**rec, "error": "source_missing" if isinstance(e, FileNotFoundError) and str(e) == "source_missing" else str(e)})
         if i % 50 == 0:
             print(f"  heartbeat {i}/{len(ordered)} ok={len(ok)} fail={len(fail)}", flush=True)
     still = []
     for rec in fail:
-        src = Path(rec["path"])
-        dest = Path(rec["dest"])
-        action = (rec.get("action") or "rename").strip()
         first = rec.get("error") or ""
+        src, dest = Path(rec["path"]), Path(rec["dest"])
+        if first in ("source_missing", "stopped"):
+            still.append(rec)
+            continue
+        time.sleep(0.5)
+        if not src.exists():
+            # The first attempt got it there before failing on a later step.
+            ok.append({**rec, "final": str(dest), "note": "done_before_error"})
+            continue
         try:
-            time.sleep(0.5)
-            if action in ("merge_into", "merge_season", "merge_version"):
-                # Retry the same move; never rename the folder over the merged one.
-                if not src.exists():
-                    ok.append({**rec, "final": str(dest), "note": "merged_retry"})
-                    continue
-                if action == "merge_season" and rec.get("season_no") is not None:
-                    move_into_season(src, dest, rec["season_no"])
-                else:
-                    if action == "merge_version":
-                        apply_version_names(src, rec.get("version_base") or dest.name,
-                                            rec.get("version_label") or "", rec.get("version_videos") or [])
-                    merge_folder_into(src, dest)
-                    _maybe_flatten(rec, dest)
-                ok.append({**rec, "final": str(dest), "note": "merged_retry"})
-                continue
-            if rec.get("season_wrap") is not None:
-                if src.exists() and str(src) != str(dest) and not dest.exists():
-                    move_into_season(src, dest, rec["season_wrap"])
-                elif dest.exists():
-                    wrap_into_season(dest, rec["season_wrap"])
-                else:
-                    still.append(rec)
-                    continue
-                ok.append({**rec, "final": str(dest), "note": "retry_ok"})
-                continue
-            if dest.exists() and not src.exists():
-                ok.append({**rec, "final": str(dest), "note": "already_dest"})
-                continue
-            if not src.exists():
-                still.append(rec)
-                continue
-            _rename_one(src, dest)
-            _maybe_flatten(rec, dest)
-            ok.append({**rec, "final": str(dest), "note": "retry_ok"})
+            ok.append({**one(rec), "note": "retry_ok"})
         except Exception as e:
             again = str(e)
             still.append({**rec, "error": first if (not again or again == first) else f"{first}（重试：{again}）"})
     return ok, still
-
-
 
 
 def picked_title_from_cache(meta: dict):
@@ -5159,7 +5154,8 @@ def move_into_season(src: Path, dest: Path, season: int) -> None:
     """Make src (one season's folder) dest/Season NN, then drop the empty src.
 
     Usually a single folder move. If Season NN is already there, the content is merged into
-    it file by file. Show-level scraper files go to the top of dest when it has none yet."""
+    it item by item. Show-level scraper files that came with src go to the top of dest when
+    it has none yet."""
     sd = dest / season_folder_name(season)
     made_dest = not dest.exists()
     _ensure_dir(dest)
@@ -5174,26 +5170,29 @@ def move_into_season(src: Path, dest: Path, season: int) -> None:
                 except OSError:
                     pass
             raise
-        moved_from = sd
+        came = [sd / n for n, _isd, isf in _entries(sd) if isf]
     else:
+        came = []
         for child in list(src.iterdir()):
-            _rename_one(child, _unique_child_path(sd, child.name))
+            target = _unique_child_path(sd, child.name)
+            _rename_one(child, target)
+            if target.is_file():
+                came.append(target)
         try:
             if not any(src.iterdir()):
                 src.rmdir()
                 _log_op("rmdir", path=str(src))
         except Exception:
             pass
-        moved_from = sd
-    for child in list(moved_from.iterdir()):
-        name = child.name.lower()
-        if not child.is_file() or name not in SHOW_LEVEL_FILES:
+    for f in came:
+        name = f.name.lower()
+        if name not in SHOW_LEVEL_FILES:
             continue
-        if not (dest / child.name).exists():
-            _rename_one(child, dest / child.name)
+        if not (dest / f.name).exists():
+            _rename_one(f, dest / f.name)
         elif name == "tvshow.nfo":
             # The show already has one; inside a season folder it would only confuse Emby.
-            _rename_one(child, _unique_child_path(sd, "tvshow.nfo.old"))
+            _rename_one(f, _unique_child_path(sd, "tvshow.nfo.old"))
 
 
 def wrap_into_season(folder: Path, season: int) -> None:
@@ -5692,12 +5691,35 @@ def check_movie_durations(leaves: list, cache: dict) -> tuple[list, list]:
 
 
 def main():
+    """Run (see _main); 停止 ends it cleanly: what was changed so far stays undoable."""
+    _STOP_STATE.update(set=False, checked=0.0)
+    try:
+        return _main()
+    except RunStopped:
+        print("-" * 60, flush=True)
+        print("已停止。", flush=True)
+        if CHANGE_LOG and SCAN_ROOT is not None:
+            save_history(SCAN_ROOT)
+            print(f"已经做的改动已记录，可以用「撤销上次改名」还原（{len(CHANGE_LOG)} 步）。", flush=True)
+        return 3
+    finally:
+        try:
+            stop_request_path().unlink()
+        except OSError:
+            pass
+
+
+def _main():
     global API_KEY, TOOLS, CACHE_PATH, SEARCH_CACHE_PATH
     # GUI may set TMDB_API_KEY / TMDB_TOOLS_DIR after this module was first imported.
     TOOLS = _data_dir()
     CACHE_PATH = TOOLS / "tmdb_movie_title_cache.json"
     SEARCH_CACHE_PATH = TOOLS / "tmdb_search_cache.json"
     API_KEY = _load_api_key()
+    try:
+        stop_request_path().unlink()  # left over from an earlier run
+    except OSError:
+        pass
     args = [a for a in sys.argv[1:] if a]
     if "--undo" in args:
         return 1 if undo_last_run() else 0
@@ -5759,7 +5781,7 @@ def main():
     elif preview:
         poster_mode = "预览（不下载）"
     else:
-        poster_mode = "下载到电影文件夹"
+        poster_mode = "下载到影视文件夹"
     print(f"封面图片 = {poster_mode}", flush=True)
     if no_nfo:
         nfo_mode = "关闭"
@@ -5805,7 +5827,7 @@ def main():
         tagged = stay
         print(f"  跳过已刮削（名字已含 [tmdbid=]）: {len(skipped_done)}", flush=True)
 
-    search_cache = load_json(SEARCH_CACHE_PATH)
+    search_cache = load_search_cache()
     USER_CHOICES.clear()
     USER_CHOICES.update(load_user_choices())
     leaves = list(tagged)
@@ -5865,26 +5887,14 @@ def main():
     for tid, kind in ids:
         key = ckey(tid, kind)
         meta = cache.get(key) or {}
-        # Re-pick title with current language rules (cache may be stale)
-        if meta.get("ok") and any(meta.get(k) for k in ("title_zh", "title_tw", "title_hk", "title_en")):
-            fake_zh = {"title": meta.get("title_zh"), "release_date": meta.get("release_date")}
-            fake_tw = {"title": meta.get("title_tw")}
-            fake_hk = {"title": meta.get("title_hk")}
-            fake_en = {
-                "title": meta.get("title_en"),
-                "original_title": meta.get("original_title"),
-                "release_date": meta.get("release_date"),
-            }
-            title, year, lang = pick_from_langs(fake_zh, fake_tw, fake_hk, fake_en, fake_en)
-            if title:
-                meta = dict(meta)
-                meta["picked_title"] = title
-                meta["picked_lang"] = lang
-                if year:
-                    meta["year"] = year
-                cache[key] = meta
-        if cache_needs_refetch(meta):
-            fetch_movie(tid, cache, kind=kind)
+        if meta.get("ok"):
+            # Entries cached by older versions: re-pick the title with today's language rules
+            # (the nfo and tmdb.html use picked_title too).
+            title, year, lang = picked_title_from_cache(meta)
+            if title and (title, lang) != (meta.get("picked_title"), meta.get("picked_lang")):
+                cache[key] = {**meta, "picked_title": title, "picked_lang": lang, "year": year or meta.get("year")}
+        if cache_needs_refetch(cache.get(key) or {}):
+            fetch_movie(tid, cache, kind=kind)  # one more try for a fetch that failed above
     save_json(CACHE_PATH, cache)
 
     # Movies: does the video's length fit the film we matched? (cheap header read)
@@ -6044,7 +6054,6 @@ def main():
             if prim:
                 break
         if prim is None:
-            prim = next((r for r in skip if r.get("path") == prim_path), None)
             for m in members[1:]:
                 skip.append({**m, "reason": "dest_exists"})
             continue
@@ -6251,21 +6260,6 @@ def main():
             print(f"网页快照 tmdb.html：将写/已写={html_st['ok']} 失败={html_st['fail']}", flush=True)
             for s in samples:
                 print(f"  结果: {_zh_art_status(s)}", flush=True)
-            (TOOLS / "tmdb_format_rename_posters.json").write_text(
-                json.dumps(
-                    {
-                        "art_stats": art_st,
-                        "nfo_stats": nfo_st,
-                        "html_stats": html_st,
-                        "samples": samples,
-                        "count": len(targets),
-                        "wrapped_count": len(wrapped),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
         else:
             print("没有需要处理封面/NFO/网页的文件夹。", flush=True)
 
@@ -6273,7 +6267,7 @@ def main():
     unmatched_n = len(skip) - already_ok_n
     print("-" * 60, flush=True)
     print("汇总（分类）：", flush=True)
-    print(f"  已识别电影文件夹 = {len(leaves)}", flush=True)
+    print(f"  已识别影视文件夹 = {len(leaves)}", flush=True)
     print(f"  待改名 = {len(plan)}", flush=True)
     print(f"  已正确命名（无需改） = {already_ok_n}", flush=True)
     if only_new:
@@ -6282,11 +6276,6 @@ def main():
     print(f"  散落视频整理 = {len(wrapped)}", flush=True)
     print(f"  改名成功 = {len(ok)}", flush=True)
     print(f"  改名失败 = {len(fail)}", flush=True)
-    print(
-        f"（旧格式对照：电影文件夹={len(leaves)} 待改名={len(plan)} 跳过={len(skip)} "
-        f"散落整理={len(wrapped)} 改名成功={len(ok)} 改名失败={len(fail)}）",
-        flush=True,
-    )
 
     print("-" * 60, flush=True)
     print("说明：", flush=True)
