@@ -1828,6 +1828,17 @@ def sequel_mark(text: str) -> str:
     return ""
 
 
+_DISC_MARK_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:disc|disk|dvd|cd)[.\s_\-]*0*\d+(?![A-Za-z0-9])|(?<![A-Za-z0-9])d[.\s_\-]*0*\d{1,2}(?![A-Za-z0-9])"
+)
+
+
+def strip_disc_marks(s: str) -> str:
+    """Drop CD2 / Disc 2 / D02: a disc number is not a sequel number (Avatar.2009.CD2).
+    Part 2 stays: it is often part of the title (Deathly Hallows Part 2)."""
+    return _DISC_MARK_RE.sub(" ", s or "")
+
+
 def query_has_sequel(q: str, mark: str) -> bool:
     if not mark:
         return True
@@ -2822,8 +2833,17 @@ def collapse_multidisc_leaves(leaves: list, root: Path) -> tuple[list, list]:
             parent_is_root = parent_path.resolve() == root_res
         except Exception:
             parent_is_root = str(parent_path) == str(root)
+        # The parent is renamed only when it holds nothing but these discs. A category
+        # folder ("电影" with other films next to the discs) must never become the film.
+        members = {_path_key(g["path"]) for g in group}
+        try:
+            others = [d for d in interesting_subdirs(parent_path)
+                      if _path_key(d) not in members and (has_video(d) or is_disc_structure(d))]
+            parent_only_discs = not others and not has_video(parent_path)
+        except Exception:
+            parent_only_discs = False
 
-        if not parent_is_root:
+        if not parent_is_root and parent_only_discs:
             synth = {
                 "path": str(parent_path),
                 "name": parent_path.name,
@@ -3389,7 +3409,7 @@ def _try_unique_title_search(leaf: dict, search_cache: dict) -> bool:
     # Do not fall back to the first year inside a range (1940–1958); extract_year
     # already returns None for ranges on purpose.
     if not year and not re.search(r"(?:19|20)\d{2}\s*[–—\-]\s*(?:19|20)\d{2}", name0):
-        m = re.search(r"(?:^|[^\d])((?:19|20)\d{2})(?:[^\d]|$)", name0)
+        m = re.search(r"(?:^|[^\d])((?:19|20)\d{2})(?:[^\d]|$)", strip_tmdb_markers(name0))
         if m:
             year = m.group(1)
     queries: list[str] = []
@@ -3421,7 +3441,9 @@ def _try_unique_title_search(leaf: dict, search_cache: dict) -> bool:
     ).strip()
     for query in uniq:
         tid, how = search_tmdb(query, year, search_cache, prefer_tid=prefer, prefer_kind=folder_media_hint(name0))
-        if not tid:
+        if not tid or (prefer and str(tid) != prefer):
+            # Only tells movie from show for the id the folder already names; another id
+            # found by title must never replace it.
             continue
         cent = search_cache.get(
             _search_cache_key(query, year, prefer, folder_media_hint(name0))
@@ -3681,8 +3703,8 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
     # The parent's trailing digit (a library root called "Movies2") is not a sequel
     # mark of this leaf; only count it when the parent is what we are searching.
     # Season markers (S01, 第一季) are not sequel marks of a title.
-    src_mark = sequel_mark(strip_season_tokens(leaf.get("name") or "")) or (
-        sequel_mark(strip_season_tokens(parent_name or "")) if parent_queries and not has_own_queries else ""
+    src_mark = sequel_mark(strip_disc_marks(strip_season_tokens(leaf.get("name") or ""))) or (
+        sequel_mark(strip_disc_marks(strip_season_tokens(parent_name or ""))) if parent_queries and not has_own_queries else ""
     )
     def _q_rank(q: str):
         junk = 1 if re.search(r"\d{4}\s*[–—\-]\s*\d{4}", q) or (re.search(r"\b(?:19|20)\d{2}\b", q) and not re.fullmatch(r"\d{1,4}", q.strip())) else 0
@@ -4578,12 +4600,14 @@ def _rename_one(src: Path, dest: Path) -> None:
                 continue
             raise
     import subprocess
+    # Every path in double quotes, the whole line wrapped for /s: names with & ( ) ^ stay
+    # names instead of becoming cmd syntax. No /Y: an existing target is never replaced.
     if src.parent == dest.parent:
-        cmd = ["cmd", "/c", "ren", str(src), dest.name]
+        line = f'ren "{src}" "{dest.name}"'
     else:
-        cmd = ["cmd", "/c", "move", str(src), str(dest)]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore",
-                       stdin=subprocess.DEVNULL)
+        line = f'move "{src}" "{dest}"'
+    r = subprocess.run(f'cmd /d /s /c "{line}"', capture_output=True, text=True, encoding="utf-8",
+                       errors="ignore", stdin=subprocess.DEVNULL)
     if r.returncode != 0 or not dest.exists() or src.exists():
         err = (r.stderr or r.stdout or "").strip() or f"code={r.returncode}"
         raise OSError(f"这个盘不支持此移动（{last}；cmd: {err}）: {src} -> {dest}")
