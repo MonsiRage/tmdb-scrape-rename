@@ -4499,10 +4499,17 @@ def save_history(root) -> None:
         ops = list(CHANGE_LOG)
     if not ops:
         return
-    if _RUN_STAMP[0] is None:
+    first = _RUN_STAMP[0] is None
+    if first:
         _RUN_STAMP[0] = datetime.now().strftime("%Y%m%d-%H%M%S")
     try:
         history_dir().mkdir(parents=True, exist_ok=True)
+        if first:  # keep the newest 30 records; only the newest is ever undone
+            for old in sorted(history_dir().glob("*.json"))[:-29]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
         path = history_dir() / f"{_RUN_STAMP[0]}.json"
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(
@@ -5764,6 +5771,7 @@ def _main():
     with _CHANGE_LOCK:
         CHANGE_LOG.clear()
     _RUN_STAMP[0] = None
+    _URL_CACHE.clear()  # the exe runs many scans in one process: start each from fresh TMDB data
     preview = "--preview" in args or "-n" in args
     no_poster = "--no-poster" in args
     no_nfo = "--no-nfo" in args
