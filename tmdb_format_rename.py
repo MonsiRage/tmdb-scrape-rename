@@ -3700,6 +3700,9 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
     if region:
         uniq = [q for q in dict.fromkeys(strip_region_words(q, region) for q in uniq) if q]
     queries = with_dot_variants(uniq)
+    # Last-resort shorter titles (see the no-results fallback below); asked last.
+    prefix_queries = [q for q in leaf.get("_prefix_queries") or [] if q.lower() not in seen_q]
+    queries += prefix_queries
     last_how = "empty_query"
     last_query = ""
     last_cent = None
@@ -3728,6 +3731,8 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
                     note = f"文件夹名标了「{'/'.join(sorted(region['countries']))}」版，但匹配到的是 {chosen_c.get('country') or chosen_c.get('lang') or '?'} 制作"
             if not note and qual and not region and _norm_match_title(qual) not in _norm_match_title(query):
                 note = f"文件夹名里的「{qual}」没有出现在搜索词里，可能是另一个版本"
+            if not note and query in prefix_queries:
+                note = f"只用文件夹名的前半段「{query}」才搜到，需要确认"
             if not note and isinstance(cent, dict) and not (_prefer_tid and str(_prefer_tid) == str(tid)):
                 # The query builder may have dropped a word of the real title (It Boy -> Boy).
                 note = folder_title_mismatch_note(leaf.get("name") or "", cent.get("titles") or [], region)
@@ -3793,6 +3798,15 @@ def resolve_leaf_id(leaf: dict, search_cache: dict):
         leaf.update(pending)
         leaf["search_year"] = year
         return False
+    if not saw_search_error and not leaf.get("_prefix_queries") and last_how == "no_results":
+        # Nothing at all: TMDB may list only the first part of the title (folder "Series 7
+        # The Contenders", TMDB "Series 7"). Ask with shorter word prefixes; any hit from
+        # them is only offered as a candidate in 需要确认, never renamed on its own.
+        words = next((q.split() for q in queries if len(q.split()) >= 3), [])
+        prefixes = [" ".join(words[:k]) for k in range(len(words) - 1, 1, -1)]
+        if prefixes:
+            leaf["_prefix_queries"] = prefixes
+            return resolve_leaf_id(leaf, search_cache)
     # A later "no results" must not hide that an earlier query failed to reach TMDB.
     if not saw_search_error and not leaf.get("_year_retry"):
         # Nothing found for this year: the name may carry another year-looking number.

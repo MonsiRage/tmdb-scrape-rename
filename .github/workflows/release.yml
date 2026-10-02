@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v1.15"
+        description: "Release tag, e.g. v1.16"
         required: true
-        default: "v1.15"
+        default: "v1.16"
 
 permissions:
   contents: write
@@ -37,12 +37,15 @@ jobs:
           $notes = @'
           Windows 可执行版。不需要安装 Python，也不需要旁边的 .py。
 
-          这一版修合并季在网络盘 / 网盘上失败的问题：
+          这一版是全代码检查后的修复：
 
-          - 修复：合并季失败后重试时误把季文件夹改名成已存在的剧目录，报 WinError 183 并盖住了真正的错误。现在重试会重做同一个合并，并显示第一次的真实错误
-          - 合并一季时整个季文件夹只移动一次（变成 剧名\Season NN），操作少一半多，网络盘上更稳；遇到短暂的「找不到路径 / 文件被占用」会稍等重试；系统改名不支持时改用 Windows 的 move 再试
-          - 移动失败时不会留下空的剧目录，季文件夹原样不动
-          - Specials / 特别篇 / 特典 / 番外 文件夹对应 TMDB 第 0 季，放进剧目录下的 Specials，不再让整部剧卡在「看不出是第几季」
-          - 继承 v1.14：分季文件夹合并到 Season NN、新加的一季并进已有剧目录、只保留自动模式
+          - 「停止」在 exe 里终于有用了：做完手上这一步就停，已做的改动可以撤销；运行中不能再误点撤销 / 关窗口会先停止
+          - 英文片名里的 Show / Movie / Series / Film / Cinema 不再被当成类型词删掉（楚门的世界、惊声尖笑、天堂电影院、乐高大电影等以前搜不到）
+          - Specials / 特别篇 不再算进片名（假面骑士空我这类会合并成 Season 01 + Specials）
+          - 修复：连续撤销时确认框显示的和实际撤销的不是同一次
+          - 修复：整理多碟文件夹时会删掉没移出来的小文件；现在程序不删除任何文件
+          - 改名失败的重试和第一次走同一套逻辑；撤销也支持网盘
+          - 全都搜不到时，再用片名的前半段搜（如 Series.7.The.Contenders → Series 7），搜到的只作为候选列进「需要确认」，不会自动改名
+          - 旧规则留下的搜索缓存自动清掉；没有海报的影片不再每次重新下载资料
           '@
           gh release create "${{ inputs.tag }}" dist\TMDB-scrape-rename.exe --title "${{ inputs.tag }}" --notes "$notes" --target "${{ github.sha }}"
