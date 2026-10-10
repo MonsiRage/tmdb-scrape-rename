@@ -1,0 +1,32 @@
+name: Delete old releases
+
+# Manual: Actions -> "Delete old releases" -> Run workflow.
+# Deletes the release pages (and their exe) except the newest N. Tags and code stay,
+# so any version can be built again with "Build and release exe".
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "How many of the newest releases to keep"
+        required: true
+        default: "3"
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete all but the newest releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ inputs.keep }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,publishedAt \
+            --jq 'sort_by(.publishedAt) | reverse | .[].tagName' > tags.txt
+          echo "Keeping:"; head -n "$KEEP" tags.txt
+          tail -n +"$((KEEP + 1))" tags.txt | while read -r tag; do
+            echo "Deleting release $tag (tag kept)"
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+          done
