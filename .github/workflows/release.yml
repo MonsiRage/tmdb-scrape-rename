@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v1.17"
+        description: "Release tag, e.g. v1.18"
         required: true
-        default: "v1.17"
+        default: "v1.18"
 
 permissions:
   contents: write
@@ -37,12 +37,10 @@ jobs:
           $notes = @'
           Windows 可执行版。不需要安装 Python，也不需要旁边的 .py。
 
-          第二轮全代码检查的修复：
+          第三轮全代码检查的修复：
 
-          - 修复：分碟文件夹（CD1/CD2）放在「电影」这类分类文件夹里时，分类文件夹可能被整个改名成那部片；现在只合并分碟，分类文件夹不动
-          - 修复：CD2 / D2 / Disc2 的碟号被当成续集编号，第二碟搜不到
-          - 修复：名字里已有 [tmdbid=N] 的文件夹，在 N 同时是电影和剧集时可能被换成别的编号；现在只判断是电影还是剧集
-          - 修复：网盘兜底改名时，名字带 & 的文件夹会出错
-          - 每次运行都用新的 TMDB 数据（exe 里连续运行不再越用越占内存）；撤销记录只保留最近 30 次
+          - 扫描根目录直接选成一部剧（里面是 Season 1 / Season 2）时，以前每季都被当成单独的片子、什么都没做；现在整部剧一起识别改名
+          - 扫描根目录直接选成单独一季的文件夹时，以前识别不出；现在能识别
+          - 根目录里电影文件和单集文件混放时，电影以前不会被收进文件夹；现在照常整理，单集文件不动
           '@
           gh release create "${{ inputs.tag }}" dist\TMDB-scrape-rename.exe --title "${{ inputs.tag }}" --notes "$notes" --target "${{ github.sha }}"
