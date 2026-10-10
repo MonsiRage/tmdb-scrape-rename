@@ -3036,6 +3036,23 @@ def root_is_single_movie(folder: Path) -> bool:
         return False
 
 
+def root_show_kind(folder: Path) -> str:
+    """The chosen folder is one TV show: 'show' (only Season NN subfolders) or 'season'
+    (episode files, no subfolders); '' otherwise."""
+    try:
+        if is_drive_root(folder):
+            return ""
+        subs = [d for d in interesting_subdirs(folder)]
+        videos = list_videos_in_dir(folder)
+        if not videos and subs and all(is_season_dir_name(d.name) for d in subs):
+            return "show"
+        if videos and not subs and all(looks_like_episode_file(v.stem) for v in videos):
+            return "season"
+    except Exception:
+        pass
+    return ""
+
+
 _SIDECAR_EXT = {".srt", ".ass", ".ssa", ".sub", ".idx", ".sup", ".vtt", ".smi", ".sbv", ".nfo", ".jpg", ".jpeg", ".png", ".tbn"}
 
 
@@ -3066,7 +3083,7 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
 
     # skip_wrap_if_root_dedicated_leaf (never for drive roots)
     try:
-        if root_is_single_movie(root):
+        if root_is_single_movie(root) or root_show_kind(root):
             return []
     except Exception:
         pass
@@ -3106,8 +3123,12 @@ def wrap_loose_videos(root: Path, preview: bool = False) -> list[dict]:
             continue
         if is_collection_dir(d.name):
             continue
-        # TV: episode files (S01E02, 第3集) and Season folders are not loose movies.
-        if is_season_dir_name(d.name) or any(looks_like_episode_file(v.stem) for v in videos):
+        # TV: episode files (S01E02, 第3集) and Season folders are not loose movies; a film
+        # lying next to loose episodes still is.
+        if is_season_dir_name(d.name):
+            continue
+        videos = [v for v in videos if not looks_like_episode_file(v.stem)]
+        if not videos:
             continue
         # Dedicated movie leaf (incl. multi-ISO anthology): never treat as loose,
         # even when the scan root *is* that folder.
@@ -3314,6 +3335,20 @@ def collect_candidate_dirs(root: Path):
             if tid:
                 rec["tmdb"] = tid
                 rec["id_from"] = how
+                tagged.append(rec)
+            else:
+                untagged_video.append(rec)
+            return tagged, untagged_video
+        shape = root_show_kind(root)
+        if shape:
+            # The chosen folder is one show (Season folders inside) or one season: that
+            # folder is the leaf, not each Season NN inside it.
+            rec = {"path": str(root), "name": root.name, "parent": str(root.parent)}
+            if shape == "show":
+                rec.update(kind="tv_show", media="tv")
+            tid, how = extract_id_from_name(root.name)
+            if tid:
+                rec.update(tmdb=tid, id_from=how)
                 tagged.append(rec)
             else:
                 untagged_video.append(rec)
